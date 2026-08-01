@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0a4f36">
+  <meta name="description" content="Gestor móvil de expedientes PCJS conectado a Google Drive">
+  <title>SIIT Expedientes PCJS</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">S</div>
+        <div>
+          <h1>SIIT Expedientes</h1>
+          <p>Gestión documental móvil · PCJS</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="connectionBadge" class="status-pill status-offline">Sin conexión</span>
+        <button id="refreshBtn" class="icon-btn" title="Actualizar ahora" aria-label="Actualizar">↻</button>
+        <button id="accountBtn" class="account-btn" title="Cuenta">P</button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <aside class="sidebar" aria-label="Navegación">
+        <button class="nav-item active" data-view="dashboard"><span>▦</span> Expedientes</button>
+        <button class="nav-item" data-view="recent"><span>◷</span> Recientes</button>
+        <button class="nav-item" data-view="favorites"><span>★</span> Favoritos</button>
+        <button class="nav-item" data-view="trash"><span>♲</span> Papelera</button>
+        <div class="sidebar-spacer"></div>
+        <button id="settingsBtn" class="nav-item"><span>⚙</span> Configuración</button>
+        <button id="logoutBtn" class="nav-item danger"><span>⇥</span> Cerrar sesión</button>
+      </aside>
+
+      <section class="workspace">
+        <div class="hero">
+          <div>
+            <p class="eyebrow">Repositorio central sincronizado</p>
+            <h2 id="viewTitle">Expedientes de trabajo</h2>
+            <p id="viewSubtitle">Acceso seguro desde celular, tablet o cualquier laptop.</p>
+          </div>
+          <div class="hero-actions">
+            <button id="newFolderBtn" class="btn btn-secondary">＋ Nueva carpeta</button>
+            <button id="uploadBtn" class="btn btn-primary">⬆ Subir documentos</button>
+            <input id="fileInput" type="file" multiple hidden>
+          </div>
+        </div>
+
+        <div class="search-panel">
+          <div class="search-wrap">
+            <span class="search-icon">⌕</span>
+            <input id="searchInput" type="search" autocomplete="off" placeholder="Buscar por orden, empresa o documento…">
+            <button id="clearSearchBtn" class="clear-btn" aria-label="Limpiar búsqueda">×</button>
+          </div>
+          <select id="typeFilter" class="filter-select" aria-label="Filtrar por tipo">
+            <option value="">Todos los tipos</option>
+            <option value="pdf">PDF</option>
+            <option value="docx,doc">Word</option>
+            <option value="xlsx,xls,xlsm">Excel</option>
+            <option value="png,jpg,jpeg,webp">Imágenes</option>
+          </select>
+        </div>
+
+        <div id="stats" class="stats-grid">
+          <article class="stat-card"><span>Expedientes</span><strong id="statFolders">—</strong><small>carpetas principales</small></article>
+          <article class="stat-card"><span>Documentos visibles</span><strong id="statFiles">—</strong><small>en la vista actual</small></article>
+          <article class="stat-card"><span>Última actualización</span><strong id="statSync">—</strong><small>automática cada 20 s</small></article>
+        </div>
+
+        <div id="breadcrumb" class="breadcrumb" hidden></div>
+        <div id="notice" class="notice" hidden></div>
+        <div id="loading" class="loading" hidden><div class="spinner"></div><p>Consultando repositorio…</p></div>
+        <div id="content" class="content-grid"></div>
+        <div id="emptyState" class="empty-state" hidden>
+          <div class="empty-icon">⌂</div>
+          <h3>No se encontraron documentos</h3>
+          <p>Prueba con otro término o crea una carpeta de expediente.</p>
+        </div>
+      </section>
+    </main>
+
+    <nav class="bottom-nav" aria-label="Navegación móvil">
+      <button class="mobile-nav active" data-view="dashboard"><span>▦</span><small>Expedientes</small></button>
+      <button class="mobile-nav" data-view="recent"><span>◷</span><small>Recientes</small></button>
+      <button id="mobileUploadBtn" class="mobile-nav add"><span>＋</span><small>Subir</small></button>
+      <button class="mobile-nav" data-view="favorites"><span>★</span><small>Favoritos</small></button>
+      <button id="mobileSettingsBtn" class="mobile-nav"><span>⚙</span><small>Ajustes</small></button>
+    </nav>
+  </div>
+
+  <div id="loginScreen" class="login-screen">
+    <section class="login-card">
+      <div class="login-logo">S</div>
+      <p class="eyebrow">Sistema documental PCJS</p>
+      <h2>SIIT Expedientes</h2>
+      <p>Administra expedientes desde cualquier dispositivo sin depender de la laptop principal.</p>
+      <div class="login-features">
+        <span>✓ Acceso seguro con Google</span>
+        <span>✓ Sincronización en vivo con Google Drive</span>
+        <span>✓ Carga, edición, movimiento y eliminación</span>
+      </div>
+      <button id="loginBtn" class="btn btn-primary btn-large">Ingresar con paulus.iuris@gmail.com</button>
+      <button id="openSetupBtn" class="btn btn-ghost">Configurar aplicación</button>
+      <small id="loginHelp">Primero debe configurarse el identificador de la aplicación.</small>
+    </section>
+  </div>
+
+  <div id="modalBackdrop" class="modal-backdrop" hidden></div>
+
+  <section id="setupModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="setupTitle" hidden>
+    <header><div><p class="eyebrow">Configuración inicial</p><h3 id="setupTitle">Conexión segura con Google Drive</h3></div><button class="modal-close" data-close>×</button></header>
+    <div class="modal-body">
+      <label>Client ID de Google Cloud<input id="clientIdInput" type="text" placeholder="123456789-abc123.apps.googleusercontent.com"></label>
+      <label>Carpeta central en Google Drive<input id="rootFolderInput" type="text" value="EXPEDIENTES_SUNAFIL" placeholder="EXPEDIENTES_SUNAFIL"></label>
+      <label>Correo de Google autorizado<input id="preferredEmailInput" type="email" value="paulus.iuris@gmail.com" placeholder="correo@ejemplo.com"></label>
+      <input id="accountModeInput" type="hidden" value="google">
+      <div class="config-info"><b>Tipo de cuenta:</b><span>Cuenta personal de Google</span></div>
+      <div class="config-info"><b>Origen JavaScript autorizado:</b><code id="redirectUriText"></code></div>
+      <p class="form-note">El Client ID no es una contraseña. La aplicación está preparada para la cuenta paulus.iuris@gmail.com y nunca almacena tu contraseña de Google.</p>
+    </div>
+    <footer><button class="btn btn-ghost" data-close>Cancelar</button><button id="saveSetupBtn" class="btn btn-primary">Guardar configuración</button></footer>
+  </section>
+
+  <section id="actionModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="actionTitle" hidden>
+    <header><div><p class="eyebrow">Gestión documental</p><h3 id="actionTitle">Acción</h3></div><button class="modal-close" data-close>×</button></header>
+    <div id="actionBody" class="modal-body"></div>
+    <footer id="actionFooter"></footer>
+  </section>
+
+  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
+  <script src="site-config.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
