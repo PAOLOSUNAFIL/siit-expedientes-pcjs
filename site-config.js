@@ -1,7 +1,7 @@
-// Configuración compartida de SIIT Expedientes PCJS para Google Drive.
-// El correo solo sirve para validar la cuenta autorizada; la contraseña nunca se guarda.
+﻿// Configuración compartida de SIIT Expedientes PCJS para Google Drive.
+// La contraseña nunca se almacena.
 window.SIIT_CONFIG = {
-  clientId: "",
+  clientId: "98935792602-u7k6g62uefhla2l48dp6uh21s3b953n1.apps.googleusercontent.com",
   rootFolder: "EXPEDIENTES_SUNAFIL",
   preferredEmail: "paulus.iuris@gmail.com"
 };
