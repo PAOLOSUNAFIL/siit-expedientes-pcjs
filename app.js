@@ -59,12 +59,27 @@ function iconClass(item) {
   return ["","DOC"];
 }
 function isMacroOffice(item) { return ["docm","xlsm","pptm"].includes(extension(item.name)); }
+function isAndroidDevice() { return /Android/i.test(navigator.userAgent || ""); }
+function buildAndroidEditorIntent(url, packageName) {
+  const withoutScheme=url.replace(/^https:\/\//i, "");
+  const fallback=encodeURIComponent(`https://play.google.com/store/apps/details?id=${packageName}`);
+  return `intent://${withoutScheme}#Intent;scheme=https;package=${packageName};S.browser_fallback_url=${fallback};end`;
+}
 function editorInfo(item) {
   if(!item || item.folder || isMacroOffice(item)) return null;
   const ext=extension(item.name), mime=item.mimeType||"", id=encodeURIComponent(item.id);
-  if(mime==="application/vnd.google-apps.document"||["doc","docx","odt","rtf","txt"].includes(ext)) return {app:"Documentos de Google",label:"Editar original",url:`https://docs.google.com/document/d/${id}/edit?usp=drivesdk`};
-  if(mime==="application/vnd.google-apps.spreadsheet"||["xls","xlsx","ods","csv","tsv"].includes(ext)) return {app:"Hojas de cálculo de Google",label:"Editar original",url:`https://docs.google.com/spreadsheets/d/${id}/edit?usp=drivesdk`};
-  if(mime==="application/vnd.google-apps.presentation"||["ppt","pptx","odp"].includes(ext)) return {app:"Presentaciones de Google",label:"Editar original",url:`https://docs.google.com/presentation/d/${id}/edit?usp=drivesdk`};
+  if(mime==="application/vnd.google-apps.document"||["doc","docx","odt","rtf","txt"].includes(ext)) {
+    const url=`https://docs.google.com/document/d/${id}/edit?usp=drivesdk`;
+    return {app:"Documentos de Google",label:isAndroidDevice()?"Editar en Google Docs":"Editar original",url,androidPackage:"com.google.android.apps.docs.editors.docs"};
+  }
+  if(mime==="application/vnd.google-apps.spreadsheet"||["xls","xlsx","ods","csv","tsv"].includes(ext)) {
+    const url=`https://docs.google.com/spreadsheets/d/${id}/edit?usp=drivesdk`;
+    return {app:"Hojas de cálculo de Google",label:isAndroidDevice()?"Editar en Hojas de cálculo":"Editar original",url,androidPackage:"com.google.android.apps.docs.editors.sheets"};
+  }
+  if(mime==="application/vnd.google-apps.presentation"||["ppt","pptx","odp"].includes(ext)) {
+    const url=`https://docs.google.com/presentation/d/${id}/edit?usp=drivesdk`;
+    return {app:"Presentaciones de Google",label:isAndroidDevice()?"Editar en Presentaciones":"Editar original",url,androidPackage:"com.google.android.apps.docs.editors.slides"};
+  }
   return null;
 }
 function openInGoogleEditor(item) {
@@ -75,6 +90,11 @@ function openInGoogleEditor(item) {
   }
   const editor=editorInfo(item);
   if(!editor){toast("Este tipo de archivo no admite edición directa desde el celular.","error");return;}
+  if(isAndroidDevice() && editor.androidPackage){
+    toast(`Abriendo el archivo original en ${editor.app}. No elijas Microsoft Word; los cambios se guardarán en el mismo archivo de Drive.`);
+    window.location.href=buildAndroidEditorIntent(editor.url,editor.androidPackage);
+    return;
+  }
   toast(`Abriendo el archivo original en ${editor.app}. Los cambios se guardarán automáticamente en Google Drive.`);
   window.open(editor.url,"_blank","noopener");
 }
@@ -305,7 +325,7 @@ function renderItems(items,flat=false){
     const actions=isFolder
       ? '<button class="btn btn-secondary open-item">Abrir expediente</button>'
       : editor
-        ? '<button class="btn btn-secondary open-item">Ver</button><button class="btn btn-primary edit-item">✎ Editar original</button>'
+        ? `<button class="btn btn-secondary open-item">Ver</button><button class="btn btn-primary edit-item">✎ ${esc(editor.label)}</button>`
         : '<button class="btn btn-secondary open-item">Abrir</button><button class="btn btn-ghost download-item">Descargar</button>';
     const editBadge=editor?'<span class="edit-badge">Edición directa</span>':macro?'<span class="macro-badge">Conserva macros</span>':'';
     card.innerHTML=`<div class="card-top"><div class="item-icon ${cls}">${label}</div><div class="item-info">${isFolder?`<span class="order-chip">${esc(parsed.order)}</span><h3>${esc(parsed.company)}</h3><p>${esc(item.name)}</p>`:`<h3>${esc(item.name)}</h3><p>${flat?"Repositorio central":"Documento del expediente"}</p>`}</div><button class="more-btn" aria-label="Más acciones">⋮</button></div><div class="card-meta"><span>${isFolder?"Carpeta sincronizada":formatBytes(item.size)}</span><span>Modificado: ${formatDate(item.lastModifiedDateTime)}</span>${editBadge}${favs.has(item.id)?"<span>★ Favorito</span>":""}</div><div class="card-actions">${actions}</div>`;
@@ -322,7 +342,7 @@ function downloadItem(item){if(item.mimeType?.startsWith("application/vnd.google
 function openItemActions(item){
   const favs=getFavorites(),isFav=favs.has(item.id),editor=editorInfo(item),macro=isMacroOffice(item);
   openModal(els.actionModal);els.actionTitle.textContent=item.name;
-  els.actionBody.innerHTML=`<div class="context-menu"><button data-act="open">↗ ${item.folder?"Abrir carpeta":"Ver documento"}</button>${editor?'<button data-act="edit">✎ Editar el archivo original</button>':macro?'<button data-act="macro">ⓘ Cómo editar sin perder macros</button>':''}${!item.folder?'<button data-act="download">⇩ Descargar</button>':''}<button data-act="rename">✎ Cambiar nombre</button><button data-act="move">⇄ Mover</button><button data-act="favorite">${isFav?"☆ Quitar de favoritos":"★ Agregar a favoritos"}</button><button data-act="delete" style="color:var(--danger)">♲ Enviar a la papelera</button></div>`;
+  els.actionBody.innerHTML=`<div class="context-menu"><button data-act="open">↗ ${item.folder?"Abrir carpeta":"Ver documento"}</button>${editor?`<button data-act="edit">✎ ${esc(editor.label)}</button>`:macro?'<button data-act="macro">ⓘ Cómo editar sin perder macros</button>':''}${!item.folder?'<button data-act="download">⇩ Descargar</button>':''}<button data-act="rename">✎ Cambiar nombre</button><button data-act="move">⇄ Mover</button><button data-act="favorite">${isFav?"☆ Quitar de favoritos":"★ Agregar a favoritos"}</button><button data-act="delete" style="color:var(--danger)">♲ Enviar a la papelera</button></div>`;
   els.actionFooter.innerHTML="";
   els.actionBody.querySelector('[data-act="open"]').onclick=()=>{closeModals();item.folder?openFolder(item):openItem(item)};
   els.actionBody.querySelector('[data-act="edit"]')?.addEventListener("click",()=>{closeModals();openInGoogleEditor(item);});

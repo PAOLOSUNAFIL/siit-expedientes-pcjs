@@ -1,0 +1,20 @@
+SIIT EXPEDIENTES PCJS - ACTUALIZACION V3.2
+
+OBJETIVO
+Corregir definitivamente la edición de archivos Word/Excel/PowerPoint en Android.
+
+CAMBIO PRINCIPAL
+En Android, el botón de edición abre de forma dirigida la aplicación correcta de Google:
+- Word/DOCX -> Documentos de Google
+- Excel/XLSX -> Hojas de cálculo de Google
+- PowerPoint/PPTX -> Presentaciones de Google
+
+Así se evita que Microsoft Word reciba una copia temporal de solo lectura.
+Los cambios se guardan en el mismo archivo original de Google Drive.
+
+ARCHIVOS PARA SUBIR A GITHUB
+- app.js
+- sw.js
+
+Después de subirlos, espere 2 minutos, cierre completamente SIIT en el celular y vuelva a abrirlo.
+Si falta la aplicación de Google correspondiente, el botón abrirá su página de instalación en Play Store.
