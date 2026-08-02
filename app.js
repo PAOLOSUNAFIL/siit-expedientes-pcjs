@@ -1,4 +1,4 @@
-// NUBE VOLADORA PCJS V4.6 - BUSQUEDA GLOBAL ESTABLE - 02/08/2026
+// NUBE VOLADORA PCJS V5.0 - BUSQUEDA PROFESIONAL ESTABLE - 02/08/2026
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3";
 const GOOGLE_SCOPE = "openid email profile https://www.googleapis.com/auth/drive";
@@ -7,12 +7,13 @@ const CONFIG_KEY = "siit_pcjs_google_config_v2";
 const CACHE_KEY = "siit_pcjs_google_cache_v2";
 const FAV_KEY = "siit_pcjs_google_favorites_v2";
 const AUTO_REFRESH_MS = 30000;
-const FOLDER_INDEX_TTL_MS = 10 * 60 * 1000;
-const SEARCH_INDEX_TTL_MS = 5 * 60 * 1000;
-const SEARCH_INDEX_MAX_ITEMS = 50000;
+const SEARCH_INDEX_TTL_MS = 10 * 60 * 1000;
 const SEARCH_RESULT_LIMIT = 1000;
 const SEARCH_MIN_CHARS = 2;
-const SEARCH_DEBOUNCE_MS = 220;
+const SEARCH_DEBOUNCE_MS = 180;
+const SEARCH_PARENT_BATCH_SIZE = 15;
+const SEARCH_DB_NAME = "siit_pcjs_search_index_v1";
+const SEARCH_DB_STORE = "indexes";
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -43,14 +44,15 @@ let searchTimer = null;
 let loading = false;
 let autoRefreshTimer = null;
 let silentRefreshing = false;
-let folderIndex = new Map();
-let folderIndexPromise = null;
-let folderIndexUpdatedAt = 0;
-let folderIndexGeneration = 0;
-let globalSearchIndex = [];
-let globalSearchIndexPromise = null;
-let globalSearchIndexUpdatedAt = 0;
-let globalSearchIndexGeneration = 0;
+let repositoryIndex = [];
+let repositoryIndexPromise = null;
+let repositoryIndexUpdatedAt = 0;
+let repositoryIndexGeneration = 0;
+let repositoryIndexComplete = false;
+let repositoryBuildItems = [];
+let repositoryCacheLoaded = false;
+let repositoryCachePromise = null;
+const repositoryIndexListeners = new Set();
 let searchRunId = 0;
 let searchBusy = false;
 
@@ -289,153 +291,244 @@ async function ensureRootFolder() {
 async function listChildren(itemId) {
   return driveList(`'${escapeQuery(itemId)}' in parents and trashed = false`);
 }
-function invalidateSearchCaches() {
-  folderIndex = new Map();
-  folderIndexUpdatedAt = 0;
-  folderIndexGeneration++;
-  globalSearchIndex = [];
-  globalSearchIndexUpdatedAt = 0;
-  globalSearchIndexGeneration++;
+function openSearchDb() {
+  return new Promise((resolve,reject)=>{
+    if(!("indexedDB" in window)){resolve(null);return;}
+    const request=indexedDB.open(SEARCH_DB_NAME,1);
+    request.onupgradeneeded=()=>{
+      const db=request.result;
+      if(!db.objectStoreNames.contains(SEARCH_DB_STORE))db.createObjectStore(SEARCH_DB_STORE,{keyPath:"rootId"});
+    };
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error||new Error("No se pudo abrir el índice local."));
+  });
 }
-function isFolderIndexFresh() {
-  return folderIndex.size > 0 && Date.now() - folderIndexUpdatedAt < FOLDER_INDEX_TTL_MS;
+function serializeIndexItem(item) {
+  return {
+    id:item.id,name:item.name,mimeType:item.mimeType,size:item.size||0,
+    webUrl:item.webUrl||"",webContentLink:item.webContentLink||"",
+    lastModifiedDateTime:item.lastModifiedDateTime||"",createdDateTime:item.createdDateTime||"",
+    parents:item.parents||[],isFolder:!!item.folder,
+    searchPath:item.searchPath||item.name,searchLocation:item.searchLocation||"Repositorio central"
+  };
 }
-async function buildFolderIndex() {
-  const folders=await driveList(`mimeType = '${FOLDER_MIME}' and trashed = false`,{orderBy:"name"});
-  const map=new Map(folders.map(folder=>[folder.id,folder]));
-  if(rootItem)map.set(rootItem.id,rootItem);
-  return map;
+function deserializeIndexItem(item) {
+  const normalizedName=normalizeSearchText(item.name);
+  return {
+    id:item.id,name:item.name,mimeType:item.mimeType,size:Number(item.size||0),
+    folder:item.isFolder?{childCount:null}:null,file:item.isFolder?null:{mimeType:item.mimeType},
+    webUrl:item.webUrl||`https://drive.google.com/open?id=${encodeURIComponent(item.id)}`,
+    webContentLink:item.webContentLink||"",lastModifiedDateTime:item.lastModifiedDateTime||"",
+    createdDateTime:item.createdDateTime||"",parents:item.parents||[],
+    parentReference:{id:item.parents?.[0]||"",path:""},
+    searchPath:item.searchPath||item.name,searchLocation:item.searchLocation||"Repositorio central",
+    normalizedName,nameWords:normalizedName.split(" ").filter(Boolean)
+  };
 }
-async function getFolderIndex({force=false}={}) {
-  if(!force&&isFolderIndexFresh())return folderIndex;
-  if(folderIndexPromise)return folderIndexPromise;
-  const generation=folderIndexGeneration;
-  folderIndexPromise=buildFolderIndex()
-    .then(map=>{
-      if(generation===folderIndexGeneration){
-        folderIndex=map;
-        folderIndexUpdatedAt=Date.now();
-      }
-      return map;
-    })
-    .finally(()=>{folderIndexPromise=null;});
-  return folderIndexPromise;
-}
-function isGlobalSearchIndexFresh() {
-  return globalSearchIndex.length > 0 && Date.now() - globalSearchIndexUpdatedAt < SEARCH_INDEX_TTL_MS;
-}
-async function buildGlobalSearchIndex() {
-  const [folders, allItems] = await Promise.all([
-    getFolderIndex(),
-    driveList(`trashed = false`, {orderBy:"folder,name", maxPages:50, maxItems:SEARCH_INDEX_MAX_ITEMS})
-  ]);
-  const seen = new Set();
-  return allItems
-    .map(item=>annotateItemInsideRoot(item,folders))
-    .filter(Boolean)
-    .filter(item=>{
-      if(seen.has(item.id))return false;
-      seen.add(item.id);
-      return true;
+async function readRepositoryIndexCache() {
+  if(!rootItem?.id)return null;
+  try {
+    const db=await openSearchDb();
+    if(!db)return null;
+    return await new Promise((resolve,reject)=>{
+      const tx=db.transaction(SEARCH_DB_STORE,"readonly");
+      const request=tx.objectStore(SEARCH_DB_STORE).get(rootItem.id);
+      request.onsuccess=()=>resolve(request.result||null);
+      request.onerror=()=>reject(request.error);
+      tx.oncomplete=()=>db.close();
     });
+  } catch(error) {
+    console.warn("No se pudo leer el índice local",error);
+    return null;
+  }
 }
-async function getGlobalSearchIndex({force=false}={}) {
-  if(!force&&isGlobalSearchIndexFresh())return globalSearchIndex;
-  if(globalSearchIndexPromise)return globalSearchIndexPromise;
-  const generation=globalSearchIndexGeneration;
-  globalSearchIndexPromise=buildGlobalSearchIndex()
-    .then(items=>{
-      if(generation===globalSearchIndexGeneration){
-        globalSearchIndex=items;
-        globalSearchIndexUpdatedAt=Date.now();
+async function writeRepositoryIndexCache(items) {
+  if(!rootItem?.id||!items.length)return;
+  try {
+    const db=await openSearchDb();
+    if(!db)return;
+    await new Promise((resolve,reject)=>{
+      const tx=db.transaction(SEARCH_DB_STORE,"readwrite");
+      tx.objectStore(SEARCH_DB_STORE).put({rootId:rootItem.id,savedAt:Date.now(),items:items.map(serializeIndexItem)});
+      tx.oncomplete=resolve;
+      tx.onerror=()=>reject(tx.error);
+    });
+    db.close();
+  } catch(error) {
+    console.warn("No se pudo guardar el índice local",error);
+  }
+}
+async function deleteRepositoryIndexCache() {
+  if(!rootItem?.id)return;
+  try {
+    const db=await openSearchDb();
+    if(!db)return;
+    await new Promise((resolve,reject)=>{
+      const tx=db.transaction(SEARCH_DB_STORE,"readwrite");
+      tx.objectStore(SEARCH_DB_STORE).delete(rootItem.id);
+      tx.oncomplete=resolve;
+      tx.onerror=()=>reject(tx.error);
+    });
+    db.close();
+  } catch(error) {
+    console.warn("No se pudo limpiar el índice local",error);
+  }
+}
+async function ensureRepositoryCacheLoaded() {
+  if(repositoryCacheLoaded)return;
+  if(repositoryCachePromise)return repositoryCachePromise;
+  repositoryCachePromise=(async()=>{
+    const cached=await readRepositoryIndexCache();
+    if(cached?.items?.length){
+      repositoryIndex=cached.items.map(deserializeIndexItem);
+      repositoryIndexUpdatedAt=Number(cached.savedAt||0);
+      repositoryIndexComplete=true;
+      notifyRepositoryIndexListeners(repositoryIndex,true);
+    }
+    repositoryCacheLoaded=true;
+  })().finally(()=>{repositoryCachePromise=null;});
+  return repositoryCachePromise;
+}
+function invalidateSearchCaches() {
+  repositoryIndex=[];
+  repositoryBuildItems=[];
+  repositoryIndexUpdatedAt=0;
+  repositoryIndexComplete=false;
+  repositoryIndexGeneration++;
+  repositoryCacheLoaded=true;
+  deleteRepositoryIndexCache();
+  setTimeout(()=>{if(accessToken&&rootItem)warmSearchIndex(true);},500);
+}
+function isRepositoryIndexFresh() {
+  return repositoryIndexComplete&&repositoryIndex.length>0&&Date.now()-repositoryIndexUpdatedAt<SEARCH_INDEX_TTL_MS;
+}
+function subscribeRepositoryIndex(listener) {
+  repositoryIndexListeners.add(listener);
+  return ()=>repositoryIndexListeners.delete(listener);
+}
+function notifyRepositoryIndexListeners(items,complete=false) {
+  for(const listener of repositoryIndexListeners){
+    try{listener(items,complete);}catch(error){console.warn("Error al actualizar resultados",error);}
+  }
+}
+function annotateRepositoryItem(item,parentPath="") {
+  const searchPath=parentPath?`${parentPath} / ${item.name}`:item.name;
+  const parts=searchPath.split(" / ");
+  const normalizedName=normalizeSearchText(item.name);
+  return {
+    ...item,
+    searchPath,
+    searchLocation:parts.length>1?parts.slice(0,-1).join(" › "):"Repositorio central",
+    normalizedName,
+    nameWords:normalizedName.split(" ").filter(Boolean)
+  };
+}
+async function listChildrenForParents(parentIds) {
+  const ids=[...new Set(parentIds.filter(Boolean))];
+  if(!ids.length)return [];
+  const parentQuery=ids.map(id=>`'${escapeQuery(id)}' in parents`).join(" or ");
+  return driveList(`(${parentQuery}) and trashed = false`,{orderBy:"folder,name"});
+}
+async function buildRepositoryIndex(generation) {
+  const queue=[rootItem.id];
+  const seenFolders=new Set(queue);
+  const seenItems=new Set();
+  const folderPaths=new Map([[rootItem.id,""]]);
+  const indexed=[];
+
+  while(queue.length){
+    if(generation!==repositoryIndexGeneration)throw new Error("INDEX_BUILD_CANCELLED");
+    const parentIds=queue.splice(0,SEARCH_PARENT_BATCH_SIZE);
+    const parentSet=new Set(parentIds);
+    const children=await listChildrenForParents(parentIds);
+
+    for(const item of children){
+      if(seenItems.has(item.id))continue;
+      const parentId=(item.parents||[]).find(id=>parentSet.has(id)&&folderPaths.has(id))||(item.parents||[]).find(id=>folderPaths.has(id));
+      if(!parentId)continue;
+      seenItems.add(item.id);
+      const annotated=annotateRepositoryItem(item,folderPaths.get(parentId)||"");
+      indexed.push(annotated);
+      if(item.folder&&!seenFolders.has(item.id)){
+        seenFolders.add(item.id);
+        folderPaths.set(item.id,annotated.searchPath);
+        queue.push(item.id);
+      }
+    }
+
+    repositoryBuildItems=indexed.slice();
+    notifyRepositoryIndexListeners(repositoryBuildItems,false);
+    await new Promise(resolve=>setTimeout(resolve,0));
+  }
+
+  return indexed;
+}
+async function getRepositoryIndex({force=false}={}) {
+  await ensureRepositoryCacheLoaded();
+  if(!force&&isRepositoryIndexFresh())return repositoryIndex;
+  if(repositoryIndexPromise)return repositoryIndexPromise;
+  const generation=repositoryIndexGeneration;
+  repositoryIndexPromise=buildRepositoryIndex(generation)
+    .then(async items=>{
+      if(generation===repositoryIndexGeneration){
+        repositoryIndex=items;
+        repositoryBuildItems=[];
+        repositoryIndexUpdatedAt=Date.now();
+        repositoryIndexComplete=true;
+        notifyRepositoryIndexListeners(repositoryIndex,true);
+        await writeRepositoryIndexCache(repositoryIndex);
       }
       return items;
     })
-    .finally(()=>{globalSearchIndexPromise=null;});
-  return globalSearchIndexPromise;
+    .catch(error=>{
+      if(error?.message!=="INDEX_BUILD_CANCELLED")throw error;
+      return repositoryIndex;
+    })
+    .finally(()=>{repositoryIndexPromise=null;});
+  return repositoryIndexPromise;
 }
-function warmSearchIndex() {
-  setTimeout(()=>getGlobalSearchIndex().catch(error=>console.warn("No se pudo preparar el índice global de búsqueda",error)),400);
+function warmSearchIndex(force=false) {
+  setTimeout(async()=>{
+    try{
+      await ensureRepositoryCacheLoaded();
+      if(force||!isRepositoryIndexFresh())getRepositoryIndex({force:true}).catch(error=>console.warn("No se pudo preparar el índice de búsqueda",error));
+    }catch(error){console.warn("No se pudo cargar el índice de búsqueda",error);}
+  },300);
 }
 function cancelSearchInteraction() {
   clearTimeout(searchTimer);
   searchRunId++;
   searchBusy=false;
 }
-function annotateItemInsideRoot(item,folders) {
-  if(!item||item.id===rootItem?.id)return null;
-  const names=[item.name];
-  let parentId=item.parents?.[0]||"";
-  let guard=0;
-  while(parentId&&guard++<100){
-    if(parentId===rootItem.id){
-      const searchPath=names.join(" / ");
-      const parts=searchPath.split(" / ");
-      return {
-        ...item,
-        searchPath,
-        searchLocation:parts.length>1?parts.slice(0,-1).join(" › "):"Repositorio central",
-        normalizedName:normalizeSearchText(item.name),
-        nameWords:normalizeSearchText(item.name).split(" ").filter(Boolean)
-      };
-    }
-    const parent=folders.get(parentId);
-    if(!parent)return null;
-    names.unshift(parent.name);
-    parentId=parent.parents?.[0]||"";
+function mergeIndexItems(...collections) {
+  const map=new Map();
+  for(const collection of collections){
+    for(const item of collection||[])if(item?.id)map.set(item.id,item);
   }
-  return null;
+  return [...map.values()];
 }
-function tokenStartsInWords(token,words) {
-  return words.some(word=>word.startsWith(token));
-}
-function quickRootMatches(query) {
-  const normalized=normalizeSearchText(query);
-  const tokens=normalized.split(" ").filter(Boolean);
-  if(!tokens.length||normalized.replace(/\s+/g,"").length<SEARCH_MIN_CHARS)return [];
-  return rootFolders
-    .map(item=>{
-      const normalizedName=normalizeSearchText(item.name);
-      return {
-        ...item,
-        searchPath:item.name,
-        searchLocation:"Repositorio central",
-        normalizedName,
-        nameWords:normalizedName.split(" ").filter(Boolean)
-      };
-    })
-    .map(item=>({item,score:getDirectSearchScore(item,normalized,tokens)}))
-    .filter(result=>result.score!==null)
-    .sort((a,b)=>
-      a.score-b.score||
-      a.item.name.localeCompare(b.item.name,"es",{numeric:true,sensitivity:"base"})
-    )
-    .map(result=>result.item);
-}
-function getDirectSearchScore(item,normalizedQuery,tokens) {
+function getSearchScore(item,normalizedQuery,tokens) {
   const ownText=item.normalizedName||normalizeSearchText(item.name);
   const ownWords=item.nameWords||ownText.split(" ").filter(Boolean);
   const compactOwn=ownText.replace(/\s+/g,"");
   const compactQuery=normalizedQuery.replace(/\s+/g,"");
-  const prefixMatch=tokens.every(token=>tokenStartsInWords(token,ownWords));
-  const containsAllowed=compactQuery.length>=3;
-  const containsMatch=containsAllowed&&tokens.every(token=>ownText.includes(token));
-  if(!prefixMatch&&!containsMatch)return null;
+  const allContained=tokens.every(token=>ownText.includes(token));
+  if(!allContained)return null;
+  const allWordPrefixes=tokens.every(token=>ownWords.some(word=>word.startsWith(token)));
   if(ownText===normalizedQuery||compactOwn===compactQuery)return 0;
   if(ownText.startsWith(normalizedQuery)||compactOwn.startsWith(compactQuery))return 1;
-  if(prefixMatch&&item.folder)return 2;
-  if(prefixMatch)return 3;
-  if(containsMatch&&item.folder)return 4;
+  if(allWordPrefixes&&item.folder)return 2;
+  if(allWordPrefixes)return 3;
+  if(item.folder)return 4;
   return 5;
 }
-async function scopedSearch(query) {
+function searchRepositoryItems(source,query) {
   const normalized=normalizeSearchText(query);
   const tokens=normalized.split(" ").filter(Boolean);
   if(!tokens.length||normalized.replace(/\s+/g,"").length<SEARCH_MIN_CHARS)return [];
-  const index=await getGlobalSearchIndex();
   const seen=new Set();
-  return index
-    .map(item=>({item,score:getDirectSearchScore(item,normalized,tokens)}))
+  return (source||[])
+    .map(item=>({item,score:getSearchScore(item,normalized,tokens)}))
     .filter(result=>result.score!==null)
     .filter(result=>{
       if(seen.has(result.item.id))return false;
@@ -448,6 +541,26 @@ async function scopedSearch(query) {
       a.item.name.localeCompare(b.item.name,"es",{numeric:true,sensitivity:"base"})
     )
     .map(result=>result.item);
+}
+function renderSearchMatches(query,source,{building=false}={}) {
+  let matches=searchRepositoryItems(source,query);
+  matches=applyTypeFilter(matches);
+  const total=matches.length;
+  const items=matches.slice(0,SEARCH_RESULT_LIMIT);
+  currentItems=items;
+  renderItems(items,true);
+  updateStats(rootFolders,items.filter(item=>!item.folder).length);
+  if(building&&items.length===0)els.emptyState.hidden=true;
+  if(building){
+    showNotice(`Buscando “${query}” en los expedientes… ${source.length.toLocaleString("es-PE")} elementos revisados.`);
+  }else if(total===0){
+    showNotice(`No se encontraron carpetas ni documentos cuyo nombre coincida con “${query}”.`);
+  }else if(total>items.length){
+    showNotice(`Se encontraron ${total.toLocaleString("es-PE")} coincidencias. Se muestran las primeras ${items.length.toLocaleString("es-PE")}.`);
+  }else{
+    showNotice("");
+  }
+  return total;
 }
 
 async function enterApp() {
@@ -516,62 +629,61 @@ async function performSearch() {
   renderBreadcrumb();
   setConnection("sync","Buscando");
 
+  let unsubscribe=()=>{};
   try {
-    const quick=quickRootMatches(query);
+    await ensureRepositoryCacheLoaded();
     if(runId!==searchRunId)return;
-    currentItems=quick;
-    renderItems(quick,true);
-    updateStats(rootFolders,quick.filter(item=>!item.folder).length);
-    showNotice(globalSearchIndex.length
-      ? `Buscando “${query}” en todo el repositorio…`
-      : `Preparando el índice completo y buscando “${query}”…`
-    );
 
-    let matches=await scopedSearch(query);
+    const initialSource=mergeIndexItems(repositoryIndex,repositoryBuildItems);
+    renderSearchMatches(query,initialSource,{building:!isRepositoryIndexFresh()});
+
+    let lastPaint=0;
+    unsubscribe=subscribeRepositoryIndex((partial,complete)=>{
+      if(runId!==searchRunId)return;
+      const now=Date.now();
+      if(!complete&&now-lastPaint<180)return;
+      lastPaint=now;
+      const source=complete?partial:mergeIndexItems(repositoryIndex,partial);
+      renderSearchMatches(query,source,{building:!complete});
+      if(complete){
+        searchBusy=false;
+        setConnection("online","Sincronizado");
+      }
+    });
+
+    const finalIndex=await getRepositoryIndex();
     if(runId!==searchRunId)return;
-    matches=applyTypeFilter(matches);
-    const total=matches.length;
-    const items=matches.slice(0,SEARCH_RESULT_LIMIT);
-    currentItems=items;
-    renderItems(items,true);
-    updateStats(rootFolders,items.filter(item=>!item.folder).length);
-    if(total===0)showNotice(`No se encontraron carpetas ni documentos cuyo nombre coincida con “${query}”.`);
-    else if(total>items.length)showNotice(`Se encontraron ${total.toLocaleString("es-PE")} coincidencias. Se muestran las primeras ${items.length.toLocaleString("es-PE")}.`);
-    else showNotice("");
+    renderSearchMatches(query,finalIndex,{building:false});
+    searchBusy=false;
     setConnection("online","Sincronizado");
   }
   catch(error){
     console.error("Error de búsqueda",error);
     if(runId===searchRunId){
-      currentItems=[];
-      renderItems([],true);
-      updateStats(rootFolders,0);
       showNotice(`No se pudo completar la búsqueda: ${friendlyError(error)}`,"error");
       setConnection("offline","Sin conexión");
+      searchBusy=false;
     }
   }
   finally{
-    if(runId===searchRunId)searchBusy=false;
+    unsubscribe();
   }
 }
+
 function applyTypeFilter(items){const values=els.typeFilter.value.split(",").filter(Boolean);if(!values.length)return items;return items.filter(i=>currentView==="search"?!i.folder&&values.includes(extension(i.name)):i.folder||values.includes(extension(i.name)));}
 async function loadRecent(){
   showLoading(true);currentView="recent";currentFolder=null;updateViewHeader();
   try{
-    const since=new Date(Date.now()-365*24*60*60*1000).toISOString();
-    const [folders,candidates]=await Promise.all([
-      getFolderIndex(),
-      driveList(`trashed = false and mimeType != '${FOLDER_MIME}' and modifiedTime > '${since}'`,{orderBy:"modifiedTime desc",maxPages:5,maxItems:2000})
-    ]);
-    const files=candidates
-      .map(item=>annotateItemInsideRoot(item,folders))
-      .filter(Boolean)
+    const all=await getRepositoryIndex();
+    const files=all
+      .filter(item=>!item.folder)
       .sort((a,b)=>new Date(b.lastModifiedDateTime)-new Date(a.lastModifiedDateTime))
       .slice(0,100);
     currentItems=files;renderItems(applyTypeFilter(files),true);updateStats(rootFolders,files.length);renderBreadcrumb();setConnection("online","Sincronizado");
-  }catch(e){showNotice(friendlyError(e),"error");}
+  }catch(error){showNotice(friendlyError(error),"error");}
   finally{showLoading(false);}
 }
+
 function loadFavorites(){currentView="favorites";currentFolder=null;updateViewHeader();const fav=getFavorites();const cached=readCache()?.rootFolders||rootFolders;const items=cached.filter(i=>fav.has(i.id));currentItems=items;renderItems(items);updateStats(rootFolders,items.length);renderBreadcrumb();}
 function loadTrash(){currentView="trash";currentFolder=null;updateViewHeader();els.content.innerHTML=`<article class="folder-card"><div class="card-top"><div class="item-icon">♲</div><div class="item-info"><h3>Papelera de Google Drive</h3><p>Los elementos eliminados desde este sistema pueden recuperarse desde la papelera de Google Drive.</p></div></div><div class="card-actions"><button class="btn btn-primary" id="openTrashWeb">Abrir papelera</button></div></article>`;els.emptyState.hidden=true;$("openTrashWeb").onclick=()=>window.open("https://drive.google.com/drive/trash","_blank","noopener");renderBreadcrumb();}
 function updateViewHeader(){const map={dashboard:["Expedientes de trabajo","Carpetas centrales disponibles en todos tus dispositivos."],folder:[currentFolder?.name||"Carpeta","Documentos y subcarpetas del expediente."],search:["Resultados de búsqueda","Coincidencias en el repositorio central."],recent:["Documentos recientes","Últimos archivos modificados en todos los expedientes."],favorites:["Expedientes favoritos","Accesos marcados en este dispositivo."],trash:["Papelera","Recuperación de documentos eliminados."]};[els.viewTitle.textContent,els.viewSubtitle.textContent]=map[currentView]||map.dashboard;document.querySelectorAll("[data-view]").forEach(b=>b.classList.toggle("active",b.dataset.view===currentView));}
