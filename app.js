@@ -6,6 +6,8 @@ const CONFIG_KEY = "siit_pcjs_google_config_v2";
 const CACHE_KEY = "siit_pcjs_google_cache_v2";
 const FAV_KEY = "siit_pcjs_google_favorites_v2";
 const AUTO_REFRESH_MS = 30000;
+const SEARCH_INDEX_TTL_MS = 5 * 60 * 1000;
+const SEARCH_RESULT_LIMIT = 1000;
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -36,6 +38,11 @@ let searchTimer = null;
 let loading = false;
 let autoRefreshTimer = null;
 let silentRefreshing = false;
+let repositoryIndex = [];
+let repositoryIndexPromise = null;
+let repositoryIndexUpdatedAt = 0;
+let repositoryIndexGeneration = 0;
+let searchRunId = 0;
 
 function loadConfig() {
   const defaults = window.SIIT_CONFIG || { clientId: "", rootFolder: "EXPEDIENTES_SUNAFIL", preferredEmail: "paulus.iuris@gmail.com" };
@@ -48,6 +55,16 @@ function esc(value="") { return String(value).replace(/[&<>'"]/g, c => ({"&":"&a
 function formatBytes(bytes=0) { const value=Number(bytes||0); if (!value) return "0 B"; const units=["B","KB","MB","GB","TB"]; const i=Math.min(Math.floor(Math.log(value)/Math.log(1024)),units.length-1); return `${(value/1024**i).toFixed(i?1:0)} ${units[i]}`; }
 function formatDate(value) { if (!value) return "—"; return new Intl.DateTimeFormat("es-PE", {dateStyle:"short", timeStyle:"short"}).format(new Date(value)); }
 function extension(name="") { const p=name.toLowerCase().split("."); return p.length>1?p.pop():""; }
+function normalizeSearchText(value="") {
+  return String(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[_\-./\\]+/g, " ")
+    .replace(/[^a-zA-Z0-9ñÑ ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLocaleLowerCase("es");
+}
 function iconClass(item) {
   if (item.folder) return ["folder","▰"];
   const ext=extension(item.name), mime=item.mimeType||"";
@@ -256,25 +273,79 @@ async function ensureRootFolder() {
 async function listChildren(itemId) {
   return driveList(`'${escapeQuery(itemId)}' in parents and trashed = false`);
 }
-async function scanRecursive(folderId, limit=5000) {
-  const queue=[folderId], items=[];
-  while(queue.length && items.length<limit){
-    const id=queue.shift(); const children=await listChildren(id);
-    for(const item of children){items.push(item);if(item.folder)queue.push(item.id);if(items.length>=limit)break;}
+function invalidateRepositoryIndex() {
+  repositoryIndex = [];
+  repositoryIndexUpdatedAt = 0;
+  repositoryIndexGeneration++;
+}
+function isRepositoryIndexFresh() {
+  return repositoryIndex.length > 0 && Date.now() - repositoryIndexUpdatedAt < SEARCH_INDEX_TTL_MS;
+}
+function buildItemPath(item, byId) {
+  const names=[item.name];
+  let parentId=item.parents?.[0]||"";
+  let insideRoot=false;
+  let guard=0;
+  while(parentId && guard++<100){
+    if(parentId===rootItem.id){insideRoot=true;break;}
+    const parent=byId.get(parentId);
+    if(!parent)break;
+    names.unshift(parent.name);
+    parentId=parent.parents?.[0]||"";
   }
-  return items;
+  return insideRoot?names.join(" / "):"";
+}
+async function buildRepositoryIndex() {
+  // Una sola consulta paginada a Mi unidad es mucho más rápida que abrir carpeta por carpeta.
+  const all=await driveList("trashed = false",{orderBy:"folder,name"});
+  const byId=new Map(all.map(item=>[item.id,item]));
+  const indexed=[];
+  for(const item of all){
+    if(item.id===rootItem.id)continue;
+    const searchPath=buildItemPath(item,byId);
+    if(!searchPath)continue;
+    const parts=searchPath.split(" / ");
+    const searchLocation=parts.length>1?parts.slice(0,-1).join(" › "):"Repositorio central";
+    indexed.push({...item,searchPath,searchLocation,searchText:normalizeSearchText(searchPath),normalizedName:normalizeSearchText(item.name)});
+  }
+  return indexed;
+}
+async function getRepositoryIndex({force=false}={}) {
+  if(!force&&isRepositoryIndexFresh())return repositoryIndex;
+  if(repositoryIndexPromise)return repositoryIndexPromise;
+  const generation=repositoryIndexGeneration;
+  repositoryIndexPromise=buildRepositoryIndex()
+    .then(items=>{
+      if(generation===repositoryIndexGeneration){
+        repositoryIndex=items;
+        repositoryIndexUpdatedAt=Date.now();
+      }
+      return items;
+    })
+    .finally(()=>{repositoryIndexPromise=null;});
+  return repositoryIndexPromise;
+}
+function warmRepositoryIndex() {
+  setTimeout(()=>getRepositoryIndex().catch(error=>console.warn("No se pudo preparar el índice de búsqueda",error)),1200);
 }
 async function scopedSearch(query) {
-  const all=await scanRecursive(rootItem.id,10000);
-  const term=query.toLocaleLowerCase("es");
-  return all.filter(item=>item.name.toLocaleLowerCase("es").includes(term));
+  const all=await getRepositoryIndex();
+  const normalized=normalizeSearchText(query);
+  const tokens=normalized.split(" ").filter(Boolean);
+  if(!tokens.length)return [];
+  return all
+    .filter(item=>tokens.every(token=>item.searchText.includes(token)))
+    .sort((a,b)=>{
+      const score=item=>item.normalizedName===normalized?0:item.normalizedName.startsWith(normalized)?1:item.normalizedName.includes(normalized)?2:3;
+      return score(a)-score(b)||(a.folder===b.folder?0:a.folder?-1:1)||a.name.localeCompare(b.name,"es",{numeric:true,sensitivity:"base"});
+    });
 }
 
 async function enterApp() {
   hideLogin(); setConnection("sync","Conectando");
   const initial=(account?.name||account?.email||"P").trim().charAt(0).toUpperCase();
   els.accountBtn.textContent=initial||"P";
-  try { await ensureRootFolder(); await loadDashboard(); setConnection("online","Sincronizado"); startAutoRefresh(); }
+  try { await ensureRootFolder(); await loadDashboard(); setConnection("online","Sincronizado"); startAutoRefresh(); warmRepositoryIndex(); }
   catch(error) { console.error(error); setConnection("offline","Sin conexión"); showNotice(friendlyError(error),"error"); renderCacheFallback(); }
 }
 async function loadDashboard(silent=false) {
@@ -303,14 +374,32 @@ async function openFolder(item,silent=false) {
   finally{if(silent)silentRefreshing=false;else showLoading(false);}
 }
 async function performSearch() {
-  const query=els.searchInput.value.trim(); if(!query){ if(currentFolder)return openFolder(currentFolder); return loadDashboard(); }
-  showLoading(true); currentView="search"; updateViewHeader();
-  try { let items=await scopedSearch(query); items=applyTypeFilter(items); currentItems=items; renderItems(items,true); updateStats(rootFolders,items.filter(i=>!i.folder).length); renderBreadcrumb(); }
-  catch(error){showNotice(friendlyError(error),"error");}
-  finally{showLoading(false);}
+  const runId=++searchRunId;
+  const query=els.searchInput.value.trim();
+  if(!query){
+    showNotice("");
+    if(currentFolder)return openFolder(currentFolder);
+    return loadDashboard();
+  }
+  showLoading(true);showNotice("");currentView="search";updateViewHeader();
+  try {
+    let matches=await scopedSearch(query);
+    if(runId!==searchRunId)return;
+    matches=applyTypeFilter(matches);
+    const total=matches.length;
+    const items=matches.slice(0,SEARCH_RESULT_LIMIT);
+    currentItems=items;
+    renderItems(items,true);
+    updateStats(rootFolders,items.filter(i=>!i.folder).length);
+    renderBreadcrumb();
+    if(total>items.length)showNotice(`Se encontraron ${total.toLocaleString("es-PE")} coincidencias. Se muestran las primeras ${items.length.toLocaleString("es-PE")}; escribe un dato más específico para afinar la búsqueda.`);
+    setConnection("online","Sincronizado");
+  }
+  catch(error){if(runId===searchRunId)showNotice(friendlyError(error),"error");}
+  finally{if(runId===searchRunId)showLoading(false);}
 }
-function applyTypeFilter(items){const values=els.typeFilter.value.split(",").filter(Boolean);if(!values.length)return items;return items.filter(i=>i.folder||values.includes(extension(i.name)));}
-async function loadRecent(){showLoading(true);currentView="recent";currentFolder=null;updateViewHeader();try{const all=await scanRecursive(rootItem.id);const files=all.filter(i=>!i.folder).sort((a,b)=>new Date(b.lastModifiedDateTime)-new Date(a.lastModifiedDateTime)).slice(0,100);currentItems=files;renderItems(applyTypeFilter(files),true);updateStats(rootFolders,files.length);renderBreadcrumb();}catch(e){showNotice(friendlyError(e),"error");}finally{showLoading(false);}}
+function applyTypeFilter(items){const values=els.typeFilter.value.split(",").filter(Boolean);if(!values.length)return items;return items.filter(i=>currentView==="search"?!i.folder&&values.includes(extension(i.name)):i.folder||values.includes(extension(i.name)));}
+async function loadRecent(){showLoading(true);currentView="recent";currentFolder=null;updateViewHeader();try{const all=await getRepositoryIndex();const files=all.filter(i=>!i.folder).sort((a,b)=>new Date(b.lastModifiedDateTime)-new Date(a.lastModifiedDateTime)).slice(0,100);currentItems=files;renderItems(applyTypeFilter(files),true);updateStats(rootFolders,files.length);renderBreadcrumb();setConnection("online","Sincronizado");}catch(e){showNotice(friendlyError(e),"error");}finally{showLoading(false);}}
 function loadFavorites(){currentView="favorites";currentFolder=null;updateViewHeader();const fav=getFavorites();const cached=readCache()?.rootFolders||rootFolders;const items=cached.filter(i=>fav.has(i.id));currentItems=items;renderItems(items);updateStats(rootFolders,items.length);renderBreadcrumb();}
 function loadTrash(){currentView="trash";currentFolder=null;updateViewHeader();els.content.innerHTML=`<article class="folder-card"><div class="card-top"><div class="item-icon">♲</div><div class="item-info"><h3>Papelera de Google Drive</h3><p>Los elementos eliminados desde este sistema pueden recuperarse desde la papelera de Google Drive.</p></div></div><div class="card-actions"><button class="btn btn-primary" id="openTrashWeb">Abrir papelera</button></div></article>`;els.emptyState.hidden=true;$("openTrashWeb").onclick=()=>window.open("https://drive.google.com/drive/trash","_blank","noopener");renderBreadcrumb();}
 function updateViewHeader(){const map={dashboard:["Expedientes de trabajo","Carpetas centrales disponibles en todos tus dispositivos."],folder:[currentFolder?.name||"Carpeta","Documentos y subcarpetas del expediente."],search:["Resultados de búsqueda","Coincidencias en el repositorio central."],recent:["Documentos recientes","Últimos archivos modificados en todos los expedientes."],favorites:["Expedientes favoritos","Accesos marcados en este dispositivo."],trash:["Papelera","Recuperación de documentos eliminados."]};[els.viewTitle.textContent,els.viewSubtitle.textContent]=map[currentView]||map.dashboard;document.querySelectorAll("[data-view]").forEach(b=>b.classList.toggle("active",b.dataset.view===currentView));}
@@ -328,7 +417,7 @@ function renderItems(items,flat=false){
         ? `<button class="btn btn-secondary open-item">Ver</button><button class="btn btn-primary edit-item">✎ ${esc(editor.label)}</button>`
         : '<button class="btn btn-secondary open-item">Abrir</button><button class="btn btn-ghost download-item">Descargar</button>';
     const editBadge=editor?'<span class="edit-badge">Edición directa</span>':macro?'<span class="macro-badge">Conserva macros</span>':'';
-    card.innerHTML=`<div class="card-top"><div class="item-icon ${cls}">${label}</div><div class="item-info">${isFolder?`<span class="order-chip">${esc(parsed.order)}</span><h3>${esc(parsed.company)}</h3><p>${esc(item.name)}</p>`:`<h3>${esc(item.name)}</h3><p>${flat?"Repositorio central":"Documento del expediente"}</p>`}</div><button class="more-btn" aria-label="Más acciones">⋮</button></div><div class="card-meta"><span>${isFolder?"Carpeta sincronizada":formatBytes(item.size)}</span><span>Modificado: ${formatDate(item.lastModifiedDateTime)}</span>${editBadge}${favs.has(item.id)?"<span>★ Favorito</span>":""}</div><div class="card-actions">${actions}</div>`;
+    card.innerHTML=`<div class="card-top"><div class="item-icon ${cls}">${label}</div><div class="item-info">${isFolder?`<span class="order-chip">${esc(parsed.order)}</span><h3>${esc(parsed.company)}</h3><p>${esc(item.name)}</p>`:`<h3>${esc(item.name)}</h3><p>${flat?esc(item.searchLocation||"Repositorio central"):"Documento del expediente"}</p>`}</div><button class="more-btn" aria-label="Más acciones">⋮</button></div><div class="card-meta"><span>${isFolder?"Carpeta sincronizada":formatBytes(item.size)}</span><span>Modificado: ${formatDate(item.lastModifiedDateTime)}</span>${editBadge}${favs.has(item.id)?"<span>★ Favorito</span>":""}</div><div class="card-actions">${actions}</div>`;
     card.querySelector(".open-item").onclick=()=>isFolder?openFolder(item):openItem(item);
     card.querySelector(".edit-item")?.addEventListener("click",()=>openInGoogleEditor(item));
     card.querySelector(".more-btn").onclick=()=>openItemActions(item);
@@ -353,12 +442,12 @@ function openItemActions(item){
   els.actionBody.querySelector('[data-act="favorite"]').onclick=()=>{isFav?favs.delete(item.id):favs.add(item.id);setFavorites(favs);closeModals();toast(isFav?"Se quitó de favoritos.":"Se agregó a favoritos.");renderItems(currentItems,currentView==="search"||currentView==="recent");};
   els.actionBody.querySelector('[data-act="delete"]').onclick=()=>showDelete(item);
 }
-function showRename(item){els.actionTitle.textContent="Cambiar nombre";els.actionBody.innerHTML=`<label>Nuevo nombre<input id="renameInput" value="${esc(item.name)}"></label>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-primary" id="confirmRename">Guardar</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmRename").onclick=async()=>{const name=$("renameInput").value.trim();if(!name)return;try{await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?fields=id,name`,{method:"PATCH",body:JSON.stringify({name})});closeModals();toast("Nombre actualizado.");await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
-function showMove(item){const destinations=rootFolders.filter(f=>f.id!==item.id);els.actionTitle.textContent="Mover elemento";els.actionBody.innerHTML=`<label>Carpeta de destino<select id="moveDestination">${destinations.map(f=>`<option value="${f.id}">${esc(f.name)}</option>`).join("")}</select></label><p class="form-note">El movimiento se sincronizará automáticamente en todos tus dispositivos.</p>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-primary" id="confirmMove">Mover</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmMove").onclick=async()=>{const id=$("moveDestination").value;if(!id)return;try{let oldParent=item.parents?.[0]||item.parentReference?.id||"";if(!oldParent){const data=await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?fields=parents`);oldParent=data.parents?.[0]||"";}const params=new URLSearchParams({addParents:id,fields:"id,parents"});if(oldParent)params.set("removeParents",oldParent);await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?${params.toString()}`,{method:"PATCH",body:JSON.stringify({})});closeModals();toast("Elemento movido.");await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
-function showDelete(item){els.actionTitle.textContent="Enviar a la papelera";els.actionBody.innerHTML=`<p>¿Deseas eliminar <b>${esc(item.name)}</b>?</p><p class="form-note">Google Drive lo enviará a la papelera, desde donde podrá recuperarse.</p>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-danger" id="confirmDelete">Eliminar</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmDelete").onclick=async()=>{try{await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?fields=id,trashed`,{method:"PATCH",body:JSON.stringify({trashed:true})});closeModals();toast("Elemento enviado a la papelera.");await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
+function showRename(item){els.actionTitle.textContent="Cambiar nombre";els.actionBody.innerHTML=`<label>Nuevo nombre<input id="renameInput" value="${esc(item.name)}"></label>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-primary" id="confirmRename">Guardar</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmRename").onclick=async()=>{const name=$("renameInput").value.trim();if(!name)return;try{await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?fields=id,name`,{method:"PATCH",body:JSON.stringify({name})});closeModals();toast("Nombre actualizado.");invalidateRepositoryIndex();await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
+function showMove(item){const destinations=rootFolders.filter(f=>f.id!==item.id);els.actionTitle.textContent="Mover elemento";els.actionBody.innerHTML=`<label>Carpeta de destino<select id="moveDestination">${destinations.map(f=>`<option value="${f.id}">${esc(f.name)}</option>`).join("")}</select></label><p class="form-note">El movimiento se sincronizará automáticamente en todos tus dispositivos.</p>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-primary" id="confirmMove">Mover</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmMove").onclick=async()=>{const id=$("moveDestination").value;if(!id)return;try{let oldParent=item.parents?.[0]||item.parentReference?.id||"";if(!oldParent){const data=await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?fields=parents`);oldParent=data.parents?.[0]||"";}const params=new URLSearchParams({addParents:id,fields:"id,parents"});if(oldParent)params.set("removeParents",oldParent);await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?${params.toString()}`,{method:"PATCH",body:JSON.stringify({})});closeModals();toast("Elemento movido.");invalidateRepositoryIndex();await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
+function showDelete(item){els.actionTitle.textContent="Enviar a la papelera";els.actionBody.innerHTML=`<p>¿Deseas eliminar <b>${esc(item.name)}</b>?</p><p class="form-note">Google Drive lo enviará a la papelera, desde donde podrá recuperarse.</p>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-danger" id="confirmDelete">Eliminar</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmDelete").onclick=async()=>{try{await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?fields=id,trashed`,{method:"PATCH",body:JSON.stringify({trashed:true})});closeModals();toast("Elemento enviado a la papelera.");invalidateRepositoryIndex();await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
 
-function showNewFolder(){openModal(els.actionModal);els.actionTitle.textContent="Nueva carpeta";els.actionBody.innerHTML=`<label>Nombre de la carpeta<input id="newFolderName" placeholder="Ej.: 2200-2026_EMPRESA S.A.C."></label>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-primary" id="confirmFolder">Crear</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmFolder").onclick=async()=>{const name=$("newFolderName").value.trim();if(!name)return;const parent=currentFolder||rootItem;try{await googleFetch(`${DRIVE_API}/files?fields=id,name,mimeType,webViewLink,modifiedTime,createdTime,parents`,{method:"POST",body:JSON.stringify({name,mimeType:FOLDER_MIME,parents:[parent.id]})});closeModals();toast("Carpeta creada.");await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
-async function handleUpload(files){if(!files?.length)return;const parent=currentFolder||rootItem;openModal(els.actionModal);els.actionTitle.textContent="Subiendo documentos";els.actionBody.innerHTML=`<div class="file-list">${[...files].map((f,i)=>`<div class="file-row"><div><b>${esc(f.name)}</b><small>${formatBytes(f.size)}</small></div><span id="upStatus${i}">Pendiente</span></div>`).join("")}</div><div class="progress" style="margin-top:14px"><span id="uploadProgress"></span></div>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" id="hideUpload">Continuar en segundo plano</button>`;$("hideUpload").onclick=closeModals;let completed=0;for(let i=0;i<files.length;i++){const file=files[i],status=$("upStatus"+i);try{status.textContent="Subiendo…";await uploadFile(parent.id,file,p=>{const overall=((completed+p)/files.length)*100;const bar=$("uploadProgress");if(bar)bar.style.width=`${overall}%`;});status.textContent="Listo";}catch(e){status.textContent="Error";status.style.color="var(--danger)";toast(`${file.name}: ${friendlyError(e)}`,"error");}completed++;const bar=$("uploadProgress");if(bar)bar.style.width=`${completed/files.length*100}%`;}toast("Carga finalizada.");setTimeout(closeModals,700);els.fileInput.value="";await refreshCurrent();}
+function showNewFolder(){openModal(els.actionModal);els.actionTitle.textContent="Nueva carpeta";els.actionBody.innerHTML=`<label>Nombre de la carpeta<input id="newFolderName" placeholder="Ej.: 2200-2026_EMPRESA S.A.C."></label>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-primary" id="confirmFolder">Crear</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmFolder").onclick=async()=>{const name=$("newFolderName").value.trim();if(!name)return;const parent=currentFolder||rootItem;try{await googleFetch(`${DRIVE_API}/files?fields=id,name,mimeType,webViewLink,modifiedTime,createdTime,parents`,{method:"POST",body:JSON.stringify({name,mimeType:FOLDER_MIME,parents:[parent.id]})});closeModals();toast("Carpeta creada.");invalidateRepositoryIndex();await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
+async function handleUpload(files){if(!files?.length)return;const parent=currentFolder||rootItem;openModal(els.actionModal);els.actionTitle.textContent="Subiendo documentos";els.actionBody.innerHTML=`<div class="file-list">${[...files].map((f,i)=>`<div class="file-row"><div><b>${esc(f.name)}</b><small>${formatBytes(f.size)}</small></div><span id="upStatus${i}">Pendiente</span></div>`).join("")}</div><div class="progress" style="margin-top:14px"><span id="uploadProgress"></span></div>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" id="hideUpload">Continuar en segundo plano</button>`;$("hideUpload").onclick=closeModals;let completed=0;for(let i=0;i<files.length;i++){const file=files[i],status=$("upStatus"+i);try{status.textContent="Subiendo…";await uploadFile(parent.id,file,p=>{const overall=((completed+p)/files.length)*100;const bar=$("uploadProgress");if(bar)bar.style.width=`${overall}%`;});status.textContent="Listo";}catch(e){status.textContent="Error";status.style.color="var(--danger)";toast(`${file.name}: ${friendlyError(e)}`,"error");}completed++;const bar=$("uploadProgress");if(bar)bar.style.width=`${completed/files.length*100}%`;}toast("Carga finalizada.");setTimeout(closeModals,700);els.fileInput.value="";invalidateRepositoryIndex();await refreshCurrent();}
 async function uploadFile(parentId,file,onProgress){
   if(!accessToken)throw new Error("No existe una sesión activa con Google.");
   const sessionResponse=await fetch(`${DRIVE_UPLOAD}/files?uploadType=resumable&fields=id,name,mimeType,size,webViewLink,webContentLink,modifiedTime,createdTime,parents`,{
@@ -393,7 +482,7 @@ async function refreshCurrent({silent=false}={}){
 function navigate(view){els.searchInput.value="";if(view==="dashboard")loadDashboard();else if(view==="recent")loadRecent();else if(view==="favorites")loadFavorites();else if(view==="trash")loadTrash();}
 function startAutoRefresh(){clearInterval(autoRefreshTimer);autoRefreshTimer=setInterval(()=>{if(document.visibilityState==="visible"&&navigator.onLine&&!loading&&!silentRefreshing&&accessToken&&(currentView==="dashboard"||currentView==="folder"))refreshCurrent({silent:true});},AUTO_REFRESH_MS);}
 
-els.loginBtn.onclick=login;els.openSetupBtn.onclick=openSetup;els.settingsBtn.onclick=openSetup;els.mobileSettingsBtn.onclick=openSetup;els.logoutBtn.onclick=logout;els.refreshBtn.onclick=()=>refreshCurrent({silent:false});els.accountBtn.onclick=()=>{toast(account?.email||account?.name||"Sesión Google activa");};
+els.loginBtn.onclick=login;els.openSetupBtn.onclick=openSetup;els.settingsBtn.onclick=openSetup;els.mobileSettingsBtn.onclick=openSetup;els.logoutBtn.onclick=logout;els.refreshBtn.onclick=()=>{invalidateRepositoryIndex();refreshCurrent({silent:false});};els.accountBtn.onclick=()=>{toast(account?.email||account?.name||"Sesión Google activa");};
 els.saveSetupBtn.onclick=()=>{const clientId=els.clientIdInput.value.trim(),rootFolder=els.rootFolderInput.value.trim()||"EXPEDIENTES_SUNAFIL",preferredEmail=(els.preferredEmailInput?.value||"paulus.iuris@gmail.com").trim();if(!/^\d+-[a-z0-9_-]+\.apps\.googleusercontent\.com$/i.test(clientId)){toast("El Client ID de Google debe terminar en .apps.googleusercontent.com.","error");return;}if(!/^\S+@\S+\.\S+$/.test(preferredEmail)){toast("Escribe un correo de Google válido.","error");return;}saveConfig({clientId,rootFolder,preferredEmail});closeModals();location.reload();};
 document.querySelectorAll("[data-close]").forEach(b=>b.onclick=closeModals);els.modalBackdrop.onclick=closeModals;
 document.querySelectorAll("[data-view]").forEach(b=>b.onclick=()=>navigate(b.dataset.view));
