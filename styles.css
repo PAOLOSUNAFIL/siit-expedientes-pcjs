@@ -9,3 +9,7 @@
 
 /* Versión final 3.0: edición directa y actualización silenciosa */
 .item-icon.slides{background:#fff1df;color:#b65d00}.edit-badge,.macro-badge{padding:3px 7px;border-radius:999px;font-weight:800;font-size:.68rem}.edit-badge{background:#e1f6ea;color:#0c6844}.macro-badge{background:#fff0d9;color:#875300}.version-label{font-size:.7rem!important;opacity:.75}.card-actions .btn-primary{min-width:0}@media(max-width:420px){.card-actions{flex-wrap:wrap}.card-actions .btn{min-width:calc(50% - 4px)}}
+
+/* Corrección V3.1: respeta los elementos ocultos y elimina el aviso central de consulta. */
+[hidden]{display:none!important}
+#loading{display:none!important}

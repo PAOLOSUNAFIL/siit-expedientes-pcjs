@@ -84,7 +84,15 @@ function parseExpediente(name="") {
   return match ? {order:match[1].replace(/\s+/g," "), company:match[2]||"Sin razón social indicada"} : {order:"EXPEDIENTE",company:clean};
 }
 function setConnection(type, text) { els.connectionBadge.className=`status-pill status-${type}`; els.connectionBadge.textContent=text; }
-function showLoading(show=true) { loading=show; els.loading.hidden=!show; if(show){els.emptyState.hidden=true; els.content.innerHTML="";} }
+function showLoading(show=true) {
+  loading=show;
+  // La actualización se ejecuta sin bloquear ni ocultar los documentos ya visibles.
+  els.loading.hidden=true;
+  if(show){
+    els.emptyState.hidden=true;
+    if(accessToken) setConnection("sync","Actualizando");
+  }
+}
 function showNotice(message="", kind="warn") { els.notice.hidden=!message; els.notice.textContent=message; els.notice.style.background=kind==="error"?"#fff0ef":"#fff8dc"; els.notice.style.color=kind==="error"?"#8b1e18":"#6f5700"; }
 function toast(message, type="success") { const node=document.createElement("div"); node.className=`toast ${type}`; node.textContent=message; els.toastContainer.append(node); setTimeout(()=>node.remove(),4200); }
 function cacheState() { try { localStorage.setItem(CACHE_KEY, JSON.stringify({rootFolders, savedAt:new Date().toISOString()})); } catch {} }
