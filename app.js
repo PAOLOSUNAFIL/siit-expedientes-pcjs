@@ -1,3 +1,4 @@
+// NUBE VOLADORA PCJS V4.3 - BUSQUEDA INSTANTANEA POR INICIO - 02/08/2026
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3";
 const GOOGLE_SCOPE = "openid email profile https://www.googleapis.com/auth/drive";
@@ -7,7 +8,9 @@ const CACHE_KEY = "siit_pcjs_google_cache_v2";
 const FAV_KEY = "siit_pcjs_google_favorites_v2";
 const AUTO_REFRESH_MS = 30000;
 const SEARCH_INDEX_TTL_MS = 5 * 60 * 1000;
-const SEARCH_RESULT_LIMIT = 1000;
+const SEARCH_RESULT_LIMIT = 3000;
+const SEARCH_MIN_CHARS = 2;
+const SEARCH_DEBOUNCE_MS = 180;
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -306,7 +309,17 @@ async function buildRepositoryIndex() {
     if(!searchPath)continue;
     const parts=searchPath.split(" / ");
     const searchLocation=parts.length>1?parts.slice(0,-1).join(" › "):"Repositorio central";
-    indexed.push({...item,searchPath,searchLocation,searchText:normalizeSearchText(searchPath),normalizedName:normalizeSearchText(item.name)});
+    const normalizedName=normalizeSearchText(item.name);
+    const searchText=normalizeSearchText(searchPath);
+    indexed.push({
+      ...item,
+      searchPath,
+      searchLocation,
+      searchText,
+      normalizedName,
+      nameWords:normalizedName.split(" ").filter(Boolean),
+      pathWords:searchText.split(" ").filter(Boolean)
+    });
   }
   return indexed;
 }
@@ -328,17 +341,72 @@ async function getRepositoryIndex({force=false}={}) {
 function warmRepositoryIndex() {
   setTimeout(()=>getRepositoryIndex().catch(error=>console.warn("No se pudo preparar el índice de búsqueda",error)),1200);
 }
+function cancelSearchInteraction() {
+  clearTimeout(searchTimer);
+  searchRunId++;
+  loading=false;
+  els.loading.hidden=true;
+}
+function tokenStartsInWords(token, words) {
+  return words.some(word=>word.startsWith(token));
+}
+function getSearchMatchInfo(item, normalizedQuery, tokens) {
+  const ownText=item.normalizedName||normalizeSearchText(item.name);
+  const fullText=item.searchText||ownText;
+  const ownWords=item.nameWords||ownText.split(" ").filter(Boolean);
+  const pathWords=item.pathWords||fullText.split(" ").filter(Boolean);
+  const compactOwn=ownText.replace(/\s+/g,"");
+  const compactQuery=normalizedQuery.replace(/\s+/g,"");
+
+  // Búsqueda predictiva: cada término escrito debe ser el inicio de una
+  // palabra o número del nombre. Ej.: LI -> LIQUIDACIONES; 15 -> 1599.
+  const ownPrefix=tokens.every(token=>tokenStartsInWords(token,ownWords));
+  const pathPrefix=tokens.every(token=>tokenStartsInWords(token,pathWords));
+
+  // Para consultas de 3 o más caracteres conservamos una coincidencia
+  // secundaria por contenido, útil para razones sociales o nombres largos.
+  const allowContains=normalizedQuery.replace(/\s+/g,"").length>=3;
+  const ownContains=allowContains&&tokens.every(token=>ownText.includes(token));
+  const pathContains=allowContains&&tokens.every(token=>fullText.includes(token));
+
+  if(!ownPrefix&&!ownContains&&!pathPrefix&&!pathContains)return null;
+
+  // Una carpeta solo aparece cuando coincide por su propio nombre. Así se
+  // evitan resultados genéricos como PDF, ANEXOS o ESCANEOS por la ruta.
+  const ownMatch=ownPrefix||ownContains;
+  if(!ownMatch&&item.folder)return null;
+
+  let score=20;
+  let matchType="path";
+
+  if(ownText===normalizedQuery||compactOwn===compactQuery){score=0;matchType="exact";}
+  else if(ownText.startsWith(normalizedQuery)||compactOwn.startsWith(compactQuery)){score=1;matchType="name-start";}
+  else if(ownPrefix&&item.folder){score=2;matchType="word-start";}
+  else if(ownPrefix){score=3;matchType="word-start";}
+  else if(ownContains&&item.folder){score=4;matchType="name-contains";}
+  else if(ownContains){score=5;matchType="name-contains";}
+  else if(pathPrefix){score=6;matchType="path-start";}
+  else {score=7;matchType="path-contains";}
+
+  const depth=(item.searchPath||item.name||"").split(" / ").length;
+  return {item:{...item,searchMatchType:matchType},score,depth};
+}
 async function scopedSearch(query) {
   const all=await getRepositoryIndex();
   const normalized=normalizeSearchText(query);
   const tokens=normalized.split(" ").filter(Boolean);
-  if(!tokens.length)return [];
+  if(!tokens.length||normalized.replace(/\s+/g,"").length<SEARCH_MIN_CHARS)return [];
+
   return all
-    .filter(item=>tokens.every(token=>item.searchText.includes(token)))
-    .sort((a,b)=>{
-      const score=item=>item.normalizedName===normalized?0:item.normalizedName.startsWith(normalized)?1:item.normalizedName.includes(normalized)?2:3;
-      return score(a)-score(b)||(a.folder===b.folder?0:a.folder?-1:1)||a.name.localeCompare(b.name,"es",{numeric:true,sensitivity:"base"});
-    });
+    .map(item=>getSearchMatchInfo(item,normalized,tokens))
+    .filter(Boolean)
+    .sort((a,b)=>
+      a.score-b.score||
+      a.depth-b.depth||
+      (a.item.folder===b.item.folder?0:a.item.folder?-1:1)||
+      a.item.name.localeCompare(b.item.name,"es",{numeric:true,sensitivity:"base"})
+    )
+    .map(result=>result.item);
 }
 
 async function enterApp() {
@@ -349,7 +417,8 @@ async function enterApp() {
   catch(error) { console.error(error); setConnection("offline","Sin conexión"); showNotice(friendlyError(error),"error"); renderCacheFallback(); }
 }
 async function loadDashboard(silent=false) {
-  if(loading||silentRefreshing)return;
+  if(silent&&(loading||silentRefreshing))return;
+  if(!silent){cancelSearchInteraction();}
   if(silent)silentRefreshing=true;else showLoading(true);
   if(!silent)showNotice("");
   currentView="dashboard";currentFolder=null;updateViewHeader();
@@ -366,7 +435,8 @@ async function loadDashboard(silent=false) {
 }
 function renderCacheFallback(){const cache=readCache();if(cache?.rootFolders?.length){rootFolders=cache.rootFolders;currentItems=rootFolders;renderItems(rootFolders);showNotice(`Mostrando el último índice guardado (${formatDate(cache.savedAt)}). Los documentos requieren conexión para abrirse.`);}else{els.emptyState.hidden=false;}showLoading(false);}
 async function openFolder(item,silent=false) {
-  if(loading||silentRefreshing)return;
+  if(silent&&(loading||silentRefreshing))return;
+  if(!silent){cancelSearchInteraction();}
   if(silent)silentRefreshing=true;else showLoading(true);
   currentFolder=item;currentView="folder";updateViewHeader();
   try { const items=await listChildren(item.id);currentItems=items;renderItems(items);updateStats(rootFolders,items.filter(i=>!i.folder).length);renderBreadcrumb();setConnection("online","Sincronizado"); }
@@ -376,10 +446,17 @@ async function openFolder(item,silent=false) {
 async function performSearch() {
   const runId=++searchRunId;
   const query=els.searchInput.value.trim();
+  const normalizedQuery=normalizeSearchText(query);
   if(!query){
     showNotice("");
-    if(currentFolder)return openFolder(currentFolder);
-    return loadDashboard();
+    showLoading(false);
+    if(currentFolder)return openFolder(currentFolder,false);
+    return loadDashboard(false);
+  }
+  if(normalizedQuery.replace(/\s+/g,"").length<SEARCH_MIN_CHARS){
+    cancelSearchInteraction();
+    showNotice(`Escribe al menos ${SEARCH_MIN_CHARS} caracteres para buscar en todo el repositorio.`);
+    return;
   }
   showLoading(true);showNotice("");currentView="search";updateViewHeader();
   try {
@@ -392,7 +469,8 @@ async function performSearch() {
     renderItems(items,true);
     updateStats(rootFolders,items.filter(i=>!i.folder).length);
     renderBreadcrumb();
-    if(total>items.length)showNotice(`Se encontraron ${total.toLocaleString("es-PE")} coincidencias. Se muestran las primeras ${items.length.toLocaleString("es-PE")}; escribe un dato más específico para afinar la búsqueda.`);
+    if(total===0)showNotice(`No se encontraron carpetas ni documentos que empiecen con “${query}”. Prueba con otro inicio o escribe más caracteres.`);
+    else if(total>items.length)showNotice(`Se encontraron ${total.toLocaleString("es-PE")} coincidencias. Se muestran las primeras ${items.length.toLocaleString("es-PE")}; escribe más caracteres para afinar la búsqueda.`);
     setConnection("online","Sincronizado");
   }
   catch(error){if(runId===searchRunId)showNotice(friendlyError(error),"error");}
@@ -479,14 +557,30 @@ async function refreshCurrent({silent=false}={}){
   if(currentView==="search")return performSearch();
   return loadDashboard(silent);
 }
-function navigate(view){els.searchInput.value="";if(view==="dashboard")loadDashboard();else if(view==="recent")loadRecent();else if(view==="favorites")loadFavorites();else if(view==="trash")loadTrash();}
+function navigate(view){cancelSearchInteraction();els.searchInput.value="";if(view==="dashboard")loadDashboard();else if(view==="recent")loadRecent();else if(view==="favorites")loadFavorites();else if(view==="trash")loadTrash();}
 function startAutoRefresh(){clearInterval(autoRefreshTimer);autoRefreshTimer=setInterval(()=>{if(document.visibilityState==="visible"&&navigator.onLine&&!loading&&!silentRefreshing&&accessToken&&(currentView==="dashboard"||currentView==="folder"))refreshCurrent({silent:true});},AUTO_REFRESH_MS);}
 
 els.loginBtn.onclick=login;els.openSetupBtn.onclick=openSetup;els.settingsBtn.onclick=openSetup;els.mobileSettingsBtn.onclick=openSetup;els.logoutBtn.onclick=logout;els.refreshBtn.onclick=()=>{invalidateRepositoryIndex();refreshCurrent({silent:false});};els.accountBtn.onclick=()=>{toast(account?.email||account?.name||"Sesión Google activa");};
 els.saveSetupBtn.onclick=()=>{const clientId=els.clientIdInput.value.trim(),rootFolder=els.rootFolderInput.value.trim()||"EXPEDIENTES_SUNAFIL",preferredEmail=(els.preferredEmailInput?.value||"paulus.iuris@gmail.com").trim();if(!/^\d+-[a-z0-9_-]+\.apps\.googleusercontent\.com$/i.test(clientId)){toast("El Client ID de Google debe terminar en .apps.googleusercontent.com.","error");return;}if(!/^\S+@\S+\.\S+$/.test(preferredEmail)){toast("Escribe un correo de Google válido.","error");return;}saveConfig({clientId,rootFolder,preferredEmail});closeModals();location.reload();};
 document.querySelectorAll("[data-close]").forEach(b=>b.onclick=closeModals);els.modalBackdrop.onclick=closeModals;
 document.querySelectorAll("[data-view]").forEach(b=>b.onclick=()=>navigate(b.dataset.view));
-els.searchInput.addEventListener("input",()=>{clearTimeout(searchTimer);searchTimer=setTimeout(performSearch,500);});els.clearSearchBtn.onclick=()=>{els.searchInput.value="";refreshCurrent();};els.typeFilter.onchange=()=>{if(els.searchInput.value.trim())performSearch();else renderItems(currentItems,currentView==="recent"||currentView==="search");};
+els.searchInput.addEventListener("input",()=>{
+  clearTimeout(searchTimer);
+  if(!els.searchInput.value.trim()){
+    cancelSearchInteraction();
+    performSearch();
+    return;
+  }
+  searchTimer=setTimeout(performSearch,SEARCH_DEBOUNCE_MS);
+});
+els.clearSearchBtn.onclick=()=>{
+  els.searchInput.value="";
+  cancelSearchInteraction();
+  showNotice("");
+  if(currentFolder)openFolder(currentFolder,false);
+  else loadDashboard(false);
+};
+els.typeFilter.onchange=()=>{if(els.searchInput.value.trim())performSearch();else renderItems(currentItems,currentView==="recent"||currentView==="search");};
 els.uploadBtn.onclick=()=>els.fileInput.click();els.mobileUploadBtn.onclick=()=>els.fileInput.click();els.fileInput.onchange=()=>handleUpload(els.fileInput.files);els.newFolderBtn.onclick=showNewFolder;
 window.addEventListener("online",()=>{setConnection("sync","Actualizando");if(accessToken)refreshCurrent();});window.addEventListener("offline",()=>setConnection("offline","Sin conexión"));
 window.addEventListener("error",e=>console.error("Error global",e.error||e.message));
