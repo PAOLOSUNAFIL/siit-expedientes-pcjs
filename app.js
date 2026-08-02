@@ -5,7 +5,7 @@ const FOLDER_MIME = "application/vnd.google-apps.folder";
 const CONFIG_KEY = "siit_pcjs_google_config_v2";
 const CACHE_KEY = "siit_pcjs_google_cache_v2";
 const FAV_KEY = "siit_pcjs_google_favorites_v2";
-const AUTO_REFRESH_MS = 20000;
+const AUTO_REFRESH_MS = 30000;
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -35,6 +35,7 @@ let currentItems = [];
 let searchTimer = null;
 let loading = false;
 let autoRefreshTimer = null;
+let silentRefreshing = false;
 
 function loadConfig() {
   const defaults = window.SIIT_CONFIG || { clientId: "", rootFolder: "EXPEDIENTES_SUNAFIL", preferredEmail: "paulus.iuris@gmail.com" };
@@ -47,7 +48,36 @@ function esc(value="") { return String(value).replace(/[&<>'"]/g, c => ({"&":"&a
 function formatBytes(bytes=0) { const value=Number(bytes||0); if (!value) return "0 B"; const units=["B","KB","MB","GB","TB"]; const i=Math.min(Math.floor(Math.log(value)/Math.log(1024)),units.length-1); return `${(value/1024**i).toFixed(i?1:0)} ${units[i]}`; }
 function formatDate(value) { if (!value) return "—"; return new Intl.DateTimeFormat("es-PE", {dateStyle:"short", timeStyle:"short"}).format(new Date(value)); }
 function extension(name="") { const p=name.toLowerCase().split("."); return p.length>1?p.pop():""; }
-function iconClass(item) { if (item.folder) return ["folder","▰"]; const ext=extension(item.name); if(ext==="pdf")return["pdf","PDF"]; if(["doc","docx"].includes(ext))return["word","W"]; if(["xls","xlsx","xlsm"].includes(ext))return["excel","X"]; if(["png","jpg","jpeg","webp","gif"].includes(ext))return["image","IMG"]; return ["","DOC"]; }
+function iconClass(item) {
+  if (item.folder) return ["folder","▰"];
+  const ext=extension(item.name), mime=item.mimeType||"";
+  if(ext==="pdf")return["pdf","PDF"];
+  if(mime==="application/vnd.google-apps.document"||["doc","docx","docm","odt","rtf","txt"].includes(ext))return["word","W"];
+  if(mime==="application/vnd.google-apps.spreadsheet"||["xls","xlsx","xlsm","ods","csv","tsv"].includes(ext))return["excel","X"];
+  if(mime==="application/vnd.google-apps.presentation"||["ppt","pptx","pptm","odp"].includes(ext))return["slides","P"];
+  if(["png","jpg","jpeg","webp","gif"].includes(ext))return["image","IMG"];
+  return ["","DOC"];
+}
+function isMacroOffice(item) { return ["docm","xlsm","pptm"].includes(extension(item.name)); }
+function editorInfo(item) {
+  if(!item || item.folder || isMacroOffice(item)) return null;
+  const ext=extension(item.name), mime=item.mimeType||"", id=encodeURIComponent(item.id);
+  if(mime==="application/vnd.google-apps.document"||["doc","docx","odt","rtf","txt"].includes(ext)) return {app:"Documentos de Google",label:"Editar original",url:`https://docs.google.com/document/d/${id}/edit?usp=drivesdk`};
+  if(mime==="application/vnd.google-apps.spreadsheet"||["xls","xlsx","ods","csv","tsv"].includes(ext)) return {app:"Hojas de cálculo de Google",label:"Editar original",url:`https://docs.google.com/spreadsheets/d/${id}/edit?usp=drivesdk`};
+  if(mime==="application/vnd.google-apps.presentation"||["ppt","pptx","odp"].includes(ext)) return {app:"Presentaciones de Google",label:"Editar original",url:`https://docs.google.com/presentation/d/${id}/edit?usp=drivesdk`};
+  return null;
+}
+function openInGoogleEditor(item) {
+  if(!navigator.onLine){toast("Necesitas conexión para editar este documento.","error");return;}
+  if(isMacroOffice(item)){
+    toast("Este archivo contiene macros. Para no dañarlas, edítalo en la laptop con Microsoft Office y Google Drive para ordenadores.","error");
+    return;
+  }
+  const editor=editorInfo(item);
+  if(!editor){toast("Este tipo de archivo no admite edición directa desde el celular.","error");return;}
+  toast(`Abriendo el archivo original en ${editor.app}. Los cambios se guardarán automáticamente en Google Drive.`);
+  window.open(editor.url,"_blank","noopener");
+}
 function parseExpediente(name="") {
   const clean=name.replace(/_/g," ").trim();
   const match=clean.match(/^(\d{1,5}(?:\s*(?:y|[-/])\s*\d{1,5})?\s*-\s*20\d{2})[\s_-]*(.*)$/i);
@@ -220,20 +250,29 @@ async function enterApp() {
   catch(error) { console.error(error); setConnection("offline","Sin conexión"); showNotice(friendlyError(error),"error"); renderCacheFallback(); }
 }
 async function loadDashboard(silent=false) {
-  if(loading)return; if(!silent)showLoading(true); showNotice(""); currentView="dashboard"; currentFolder=null; updateViewHeader();
+  if(loading||silentRefreshing)return;
+  if(silent)silentRefreshing=true;else showLoading(true);
+  if(!silent)showNotice("");
+  currentView="dashboard";currentFolder=null;updateViewHeader();
   try {
     const children=await listChildren(rootItem.id);
     rootFolders=children.filter(i=>i.folder).sort((a,b)=>a.name.localeCompare(b.name,"es",{numeric:true}));
-    currentItems=rootFolders; cacheState(); renderItems(rootFolders); updateStats(rootFolders,children.filter(i=>!i.folder).length); renderBreadcrumb(); setConnection("online","Sincronizado");
-  } catch(error) { setConnection("offline","Sin conexión"); if(!silent){showNotice(friendlyError(error),"error");renderCacheFallback();} }
-  finally { if(!silent)showLoading(false); }
+    currentItems=rootFolders;cacheState();renderItems(rootFolders);updateStats(rootFolders,children.filter(i=>!i.folder).length);renderBreadcrumb();setConnection("online","Sincronizado");
+  } catch(error) {
+    setConnection("offline","Sin conexión");
+    if(!silent){showNotice(friendlyError(error),"error");renderCacheFallback();}
+  } finally {
+    if(silent)silentRefreshing=false;else showLoading(false);
+  }
 }
 function renderCacheFallback(){const cache=readCache();if(cache?.rootFolders?.length){rootFolders=cache.rootFolders;currentItems=rootFolders;renderItems(rootFolders);showNotice(`Mostrando el último índice guardado (${formatDate(cache.savedAt)}). Los documentos requieren conexión para abrirse.`);}else{els.emptyState.hidden=false;}showLoading(false);}
-async function openFolder(item) {
-  if(loading)return; showLoading(true); currentFolder=item; currentView="folder"; updateViewHeader();
-  try { const items=await listChildren(item.id); currentItems=items; renderItems(items); updateStats(rootFolders,items.filter(i=>!i.folder).length); renderBreadcrumb(); }
-  catch(error){showNotice(friendlyError(error),"error");}
-  finally{showLoading(false);}
+async function openFolder(item,silent=false) {
+  if(loading||silentRefreshing)return;
+  if(silent)silentRefreshing=true;else showLoading(true);
+  currentFolder=item;currentView="folder";updateViewHeader();
+  try { const items=await listChildren(item.id);currentItems=items;renderItems(items);updateStats(rootFolders,items.filter(i=>!i.folder).length);renderBreadcrumb();setConnection("online","Sincronizado"); }
+  catch(error){if(!silent)showNotice(friendlyError(error),"error");}
+  finally{if(silent)silentRefreshing=false;else showLoading(false);}
 }
 async function performSearch() {
   const query=els.searchInput.value.trim(); if(!query){ if(currentFolder)return openFolder(currentFolder); return loadDashboard(); }
@@ -249,16 +288,43 @@ function loadTrash(){currentView="trash";currentFolder=null;updateViewHeader();e
 function updateViewHeader(){const map={dashboard:["Expedientes de trabajo","Carpetas centrales disponibles en todos tus dispositivos."],folder:[currentFolder?.name||"Carpeta","Documentos y subcarpetas del expediente."],search:["Resultados de búsqueda","Coincidencias en el repositorio central."],recent:["Documentos recientes","Últimos archivos modificados en todos los expedientes."],favorites:["Expedientes favoritos","Accesos marcados en este dispositivo."],trash:["Papelera","Recuperación de documentos eliminados."]};[els.viewTitle.textContent,els.viewSubtitle.textContent]=map[currentView]||map.dashboard;document.querySelectorAll("[data-view]").forEach(b=>b.classList.toggle("active",b.dataset.view===currentView));}
 function updateStats(folders,files){els.statFolders.textContent=folders?.length??"—";els.statFiles.textContent=files??"—";els.statSync.textContent=new Intl.DateTimeFormat("es-PE",{hour:"2-digit",minute:"2-digit"}).format(new Date());}
 function renderBreadcrumb(){if(currentView==="folder"&&currentFolder){els.breadcrumb.hidden=false;els.breadcrumb.innerHTML=`<button data-root>Expedientes</button><span>›</span><b>${esc(currentFolder.name)}</b>`;els.breadcrumb.querySelector("[data-root]").onclick=loadDashboard;}else{els.breadcrumb.hidden=true;els.breadcrumb.innerHTML="";}}
-function renderItems(items,flat=false){const filtered=applyTypeFilter(items);els.content.innerHTML="";els.emptyState.hidden=filtered.length>0;if(!filtered.length)return;const favs=getFavorites();for(const item of filtered){const isFolder=!!item.folder;const parsed=isFolder?parseExpediente(item.name):null;const [cls,label]=iconClass(item);const card=document.createElement("article");card.className=isFolder?"folder-card":"file-card";card.innerHTML=`<div class="card-top"><div class="item-icon ${cls}">${label}</div><div class="item-info">${isFolder?`<span class="order-chip">${esc(parsed.order)}</span><h3>${esc(parsed.company)}</h3><p>${esc(item.name)}</p>`:`<h3>${esc(item.name)}</h3><p>${flat?"Repositorio central":"Documento del expediente"}</p>`}</div><button class="more-btn" aria-label="Más acciones">⋮</button></div><div class="card-meta"><span>${isFolder?"Carpeta sincronizada":formatBytes(item.size)}</span><span>Modificado: ${formatDate(item.lastModifiedDateTime)}</span>${favs.has(item.id)?"<span>★ Favorito</span>":""}</div><div class="card-actions"><button class="btn btn-secondary open-item">${isFolder?"Abrir expediente":"Abrir / editar"}</button>${!isFolder?'<button class="btn btn-ghost download-item">Descargar</button>':""}</div>`;
+function renderItems(items,flat=false){
+  const filtered=applyTypeFilter(items);els.content.innerHTML="";els.emptyState.hidden=filtered.length>0;if(!filtered.length)return;
+  const favs=getFavorites();
+  for(const item of filtered){
+    const isFolder=!!item.folder, parsed=isFolder?parseExpediente(item.name):null, [cls,label]=iconClass(item), editor=editorInfo(item), macro=isMacroOffice(item);
+    const card=document.createElement("article");card.className=isFolder?"folder-card":"file-card";
+    const actions=isFolder
+      ? '<button class="btn btn-secondary open-item">Abrir expediente</button>'
+      : editor
+        ? '<button class="btn btn-secondary open-item">Ver</button><button class="btn btn-primary edit-item">✎ Editar original</button>'
+        : '<button class="btn btn-secondary open-item">Abrir</button><button class="btn btn-ghost download-item">Descargar</button>';
+    const editBadge=editor?'<span class="edit-badge">Edición directa</span>':macro?'<span class="macro-badge">Conserva macros</span>':'';
+    card.innerHTML=`<div class="card-top"><div class="item-icon ${cls}">${label}</div><div class="item-info">${isFolder?`<span class="order-chip">${esc(parsed.order)}</span><h3>${esc(parsed.company)}</h3><p>${esc(item.name)}</p>`:`<h3>${esc(item.name)}</h3><p>${flat?"Repositorio central":"Documento del expediente"}</p>`}</div><button class="more-btn" aria-label="Más acciones">⋮</button></div><div class="card-meta"><span>${isFolder?"Carpeta sincronizada":formatBytes(item.size)}</span><span>Modificado: ${formatDate(item.lastModifiedDateTime)}</span>${editBadge}${favs.has(item.id)?"<span>★ Favorito</span>":""}</div><div class="card-actions">${actions}</div>`;
     card.querySelector(".open-item").onclick=()=>isFolder?openFolder(item):openItem(item);
+    card.querySelector(".edit-item")?.addEventListener("click",()=>openInGoogleEditor(item));
     card.querySelector(".more-btn").onclick=()=>openItemActions(item);
     card.querySelector(".download-item")?.addEventListener("click",()=>downloadItem(item));
     els.content.append(card);
-  }}
+  }
+}
 function openItem(item){if(!navigator.onLine){toast("Este documento necesita conexión o estar disponible sin conexión en Google Drive.","error");return;}window.open(item.webUrl,"_blank","noopener");}
 function downloadItem(item){if(item.mimeType?.startsWith("application/vnd.google-apps.")){window.open(item.webUrl,"_blank","noopener");return;}window.open(`https://drive.google.com/uc?export=download&id=${encodeURIComponent(item.id)}`,"_blank","noopener");}
 
-function openItemActions(item){const favs=getFavorites(),isFav=favs.has(item.id);openModal(els.actionModal);els.actionTitle.textContent=item.name;els.actionBody.innerHTML=`<div class="context-menu"><button data-act="open">↗ Abrir${item.folder?" carpeta":" / editar documento"}</button><button data-act="rename">✎ Cambiar nombre</button><button data-act="move">⇄ Mover</button><button data-act="favorite">${isFav?"☆ Quitar de favoritos":"★ Agregar a favoritos"}</button><button data-act="delete" style="color:var(--danger)">♲ Enviar a la papelera</button></div>`;els.actionFooter.innerHTML="";els.actionBody.querySelector('[data-act="open"]').onclick=()=>{closeModals();item.folder?openFolder(item):openItem(item)};els.actionBody.querySelector('[data-act="rename"]').onclick=()=>showRename(item);els.actionBody.querySelector('[data-act="move"]').onclick=()=>showMove(item);els.actionBody.querySelector('[data-act="favorite"]').onclick=()=>{isFav?favs.delete(item.id):favs.add(item.id);setFavorites(favs);closeModals();toast(isFav?"Se quitó de favoritos.":"Se agregó a favoritos.");renderItems(currentItems,currentView==="search"||currentView==="recent");};els.actionBody.querySelector('[data-act="delete"]').onclick=()=>showDelete(item);}
+function openItemActions(item){
+  const favs=getFavorites(),isFav=favs.has(item.id),editor=editorInfo(item),macro=isMacroOffice(item);
+  openModal(els.actionModal);els.actionTitle.textContent=item.name;
+  els.actionBody.innerHTML=`<div class="context-menu"><button data-act="open">↗ ${item.folder?"Abrir carpeta":"Ver documento"}</button>${editor?'<button data-act="edit">✎ Editar el archivo original</button>':macro?'<button data-act="macro">ⓘ Cómo editar sin perder macros</button>':''}${!item.folder?'<button data-act="download">⇩ Descargar</button>':''}<button data-act="rename">✎ Cambiar nombre</button><button data-act="move">⇄ Mover</button><button data-act="favorite">${isFav?"☆ Quitar de favoritos":"★ Agregar a favoritos"}</button><button data-act="delete" style="color:var(--danger)">♲ Enviar a la papelera</button></div>`;
+  els.actionFooter.innerHTML="";
+  els.actionBody.querySelector('[data-act="open"]').onclick=()=>{closeModals();item.folder?openFolder(item):openItem(item)};
+  els.actionBody.querySelector('[data-act="edit"]')?.addEventListener("click",()=>{closeModals();openInGoogleEditor(item);});
+  els.actionBody.querySelector('[data-act="macro"]')?.addEventListener("click",()=>{closeModals();toast("Para conservar las macros, abre este archivo desde Google Drive para ordenadores en la laptop y edítalo con Microsoft Office.","error");});
+  els.actionBody.querySelector('[data-act="download"]')?.addEventListener("click",()=>{closeModals();downloadItem(item);});
+  els.actionBody.querySelector('[data-act="rename"]').onclick=()=>showRename(item);
+  els.actionBody.querySelector('[data-act="move"]').onclick=()=>showMove(item);
+  els.actionBody.querySelector('[data-act="favorite"]').onclick=()=>{isFav?favs.delete(item.id):favs.add(item.id);setFavorites(favs);closeModals();toast(isFav?"Se quitó de favoritos.":"Se agregó a favoritos.");renderItems(currentItems,currentView==="search"||currentView==="recent");};
+  els.actionBody.querySelector('[data-act="delete"]').onclick=()=>showDelete(item);
+}
 function showRename(item){els.actionTitle.textContent="Cambiar nombre";els.actionBody.innerHTML=`<label>Nuevo nombre<input id="renameInput" value="${esc(item.name)}"></label>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-primary" id="confirmRename">Guardar</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmRename").onclick=async()=>{const name=$("renameInput").value.trim();if(!name)return;try{await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?fields=id,name`,{method:"PATCH",body:JSON.stringify({name})});closeModals();toast("Nombre actualizado.");await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
 function showMove(item){const destinations=rootFolders.filter(f=>f.id!==item.id);els.actionTitle.textContent="Mover elemento";els.actionBody.innerHTML=`<label>Carpeta de destino<select id="moveDestination">${destinations.map(f=>`<option value="${f.id}">${esc(f.name)}</option>`).join("")}</select></label><p class="form-note">El movimiento se sincronizará automáticamente en todos tus dispositivos.</p>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-primary" id="confirmMove">Mover</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmMove").onclick=async()=>{const id=$("moveDestination").value;if(!id)return;try{let oldParent=item.parents?.[0]||item.parentReference?.id||"";if(!oldParent){const data=await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?fields=parents`);oldParent=data.parents?.[0]||"";}const params=new URLSearchParams({addParents:id,fields:"id,parents"});if(oldParent)params.set("removeParents",oldParent);await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?${params.toString()}`,{method:"PATCH",body:JSON.stringify({})});closeModals();toast("Elemento movido.");await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
 function showDelete(item){els.actionTitle.textContent="Enviar a la papelera";els.actionBody.innerHTML=`<p>¿Deseas eliminar <b>${esc(item.name)}</b>?</p><p class="form-note">Google Drive lo enviará a la papelera, desde donde podrá recuperarse.</p>`;els.actionFooter.innerHTML=`<button class="btn btn-ghost" data-cancel>Cancelar</button><button class="btn btn-danger" id="confirmDelete">Eliminar</button>`;els.actionFooter.querySelector("[data-cancel]").onclick=closeModals;$("confirmDelete").onclick=async()=>{try{await googleFetch(`${DRIVE_API}/files/${encodeURIComponent(item.id)}?fields=id,trashed`,{method:"PATCH",body:JSON.stringify({trashed:true})});closeModals();toast("Elemento enviado a la papelera.");await refreshCurrent();}catch(e){toast(friendlyError(e),"error");}};}
@@ -287,11 +353,19 @@ async function uploadFile(parentId,file,onProgress){
 function openSetup(){els.clientIdInput.value=config.clientId||"";els.rootFolderInput.value=config.rootFolder||"EXPEDIENTES_SUNAFIL";if(els.preferredEmailInput)els.preferredEmailInput.value=config.preferredEmail||"paulus.iuris@gmail.com";els.redirectUriText.textContent=getAuthorizedOrigin();openModal(els.setupModal);}
 function openModal(modal){els.modalBackdrop.hidden=false;modal.hidden=false;}
 function closeModals(){els.modalBackdrop.hidden=true;els.setupModal.hidden=true;els.actionModal.hidden=true;}
-async function refreshCurrent(){if(!accessToken){showLogin();return;}if(currentView==="folder"&&currentFolder)return openFolder(currentFolder);if(currentView==="recent")return loadRecent();if(currentView==="favorites")return loadFavorites();if(currentView==="search")return performSearch();return loadDashboard();}
+async function refreshCurrent({silent=false}={}){
+  if(!accessToken){showLogin();return;}
+  if(currentView==="folder"&&currentFolder)return openFolder(currentFolder,silent);
+  if(silent&&(currentView!=="dashboard"&&currentView!=="folder"))return;
+  if(currentView==="recent")return loadRecent();
+  if(currentView==="favorites")return loadFavorites();
+  if(currentView==="search")return performSearch();
+  return loadDashboard(silent);
+}
 function navigate(view){els.searchInput.value="";if(view==="dashboard")loadDashboard();else if(view==="recent")loadRecent();else if(view==="favorites")loadFavorites();else if(view==="trash")loadTrash();}
-function startAutoRefresh(){clearInterval(autoRefreshTimer);autoRefreshTimer=setInterval(()=>{if(document.visibilityState==="visible"&&navigator.onLine&&!loading&&accessToken&&(currentView==="dashboard"||currentView==="folder"))refreshCurrent();},AUTO_REFRESH_MS);}
+function startAutoRefresh(){clearInterval(autoRefreshTimer);autoRefreshTimer=setInterval(()=>{if(document.visibilityState==="visible"&&navigator.onLine&&!loading&&!silentRefreshing&&accessToken&&(currentView==="dashboard"||currentView==="folder"))refreshCurrent({silent:true});},AUTO_REFRESH_MS);}
 
-els.loginBtn.onclick=login;els.openSetupBtn.onclick=openSetup;els.settingsBtn.onclick=openSetup;els.mobileSettingsBtn.onclick=openSetup;els.logoutBtn.onclick=logout;els.refreshBtn.onclick=refreshCurrent;els.accountBtn.onclick=()=>{toast(account?.email||account?.name||"Sesión Google activa");};
+els.loginBtn.onclick=login;els.openSetupBtn.onclick=openSetup;els.settingsBtn.onclick=openSetup;els.mobileSettingsBtn.onclick=openSetup;els.logoutBtn.onclick=logout;els.refreshBtn.onclick=()=>refreshCurrent({silent:false});els.accountBtn.onclick=()=>{toast(account?.email||account?.name||"Sesión Google activa");};
 els.saveSetupBtn.onclick=()=>{const clientId=els.clientIdInput.value.trim(),rootFolder=els.rootFolderInput.value.trim()||"EXPEDIENTES_SUNAFIL",preferredEmail=(els.preferredEmailInput?.value||"paulus.iuris@gmail.com").trim();if(!/^\d+-[a-z0-9_-]+\.apps\.googleusercontent\.com$/i.test(clientId)){toast("El Client ID de Google debe terminar en .apps.googleusercontent.com.","error");return;}if(!/^\S+@\S+\.\S+$/.test(preferredEmail)){toast("Escribe un correo de Google válido.","error");return;}saveConfig({clientId,rootFolder,preferredEmail});closeModals();location.reload();};
 document.querySelectorAll("[data-close]").forEach(b=>b.onclick=closeModals);els.modalBackdrop.onclick=closeModals;
 document.querySelectorAll("[data-view]").forEach(b=>b.onclick=()=>navigate(b.dataset.view));
