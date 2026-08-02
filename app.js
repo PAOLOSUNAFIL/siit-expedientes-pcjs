@@ -1,4 +1,4 @@
-// NUBE VOLADORA PCJS V4.5 - BUSQUEDA GLOBAL NORMALIZADA - 02/08/2026
+// NUBE VOLADORA PCJS V4.6 - BUSQUEDA GLOBAL ESTABLE - 02/08/2026
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3";
 const GOOGLE_SCOPE = "openid email profile https://www.googleapis.com/auth/drive";
@@ -389,6 +389,29 @@ function annotateItemInsideRoot(item,folders) {
 function tokenStartsInWords(token,words) {
   return words.some(word=>word.startsWith(token));
 }
+function quickRootMatches(query) {
+  const normalized=normalizeSearchText(query);
+  const tokens=normalized.split(" ").filter(Boolean);
+  if(!tokens.length||normalized.replace(/\s+/g,"").length<SEARCH_MIN_CHARS)return [];
+  return rootFolders
+    .map(item=>{
+      const normalizedName=normalizeSearchText(item.name);
+      return {
+        ...item,
+        searchPath:item.name,
+        searchLocation:"Repositorio central",
+        normalizedName,
+        nameWords:normalizedName.split(" ").filter(Boolean)
+      };
+    })
+    .map(item=>({item,score:getDirectSearchScore(item,normalized,tokens)}))
+    .filter(result=>result.score!==null)
+    .sort((a,b)=>
+      a.score-b.score||
+      a.item.name.localeCompare(b.item.name,"es",{numeric:true,sensitivity:"base"})
+    )
+    .map(result=>result.item);
+}
 function getDirectSearchScore(item,normalizedQuery,tokens) {
   const ownText=item.normalizedName||normalizeSearchText(item.name);
   const ownWords=item.nameWords||ownText.split(" ").filter(Boolean);
@@ -476,11 +499,12 @@ async function performSearch() {
     showNotice("");
     setConnection("online","Sincronizado");
     currentFolder=null;
-    return loadDashboard(false);
+    await loadDashboard(false);
+    return;
   }
   if(compactLength<SEARCH_MIN_CHARS){
     searchBusy=false;
-    showNotice(`Escribe al menos ${SEARCH_MIN_CHARS} caracteres. Por ejemplo: LI, 15, 1599 o 2110.`);
+    showNotice(`Escribe al menos ${SEARCH_MIN_CHARS} caracteres. Por ejemplo: LI o 15.`);
     setConnection("online","Sincronizado");
     return;
   }
@@ -492,13 +516,17 @@ async function performSearch() {
   renderBreadcrumb();
   setConnection("sync","Buscando");
 
-  const quick=quickRootMatches(query);
-  currentItems=quick;
-  renderItems(quick,true);
-  updateStats(rootFolders,quick.filter(item=>!item.folder).length);
-  showNotice(globalSearchIndex.length ? `Buscando “${query}” en todo el repositorio…` : `Preparando la búsqueda completa y buscando “${query}”…`);
-
   try {
+    const quick=quickRootMatches(query);
+    if(runId!==searchRunId)return;
+    currentItems=quick;
+    renderItems(quick,true);
+    updateStats(rootFolders,quick.filter(item=>!item.folder).length);
+    showNotice(globalSearchIndex.length
+      ? `Buscando “${query}” en todo el repositorio…`
+      : `Preparando el índice completo y buscando “${query}”…`
+    );
+
     let matches=await scopedSearch(query);
     if(runId!==searchRunId)return;
     matches=applyTypeFilter(matches);
@@ -513,8 +541,12 @@ async function performSearch() {
     setConnection("online","Sincronizado");
   }
   catch(error){
+    console.error("Error de búsqueda",error);
     if(runId===searchRunId){
-      showNotice(friendlyError(error),"error");
+      currentItems=[];
+      renderItems([],true);
+      updateStats(rootFolders,0);
+      showNotice(`No se pudo completar la búsqueda: ${friendlyError(error)}`,"error");
       setConnection("offline","Sin conexión");
     }
   }
@@ -640,10 +672,20 @@ els.searchInput.addEventListener("input",()=>{
   const normalized=normalizeSearchText(value);
   if(normalized.replace(/\s+/g,"").length<SEARCH_MIN_CHARS){
     searchBusy=false;
+    setConnection("online","Sincronizado");
     showNotice(`Escribe al menos ${SEARCH_MIN_CHARS} caracteres. Por ejemplo: LI o 15.`);
     return;
   }
-  searchTimer=setTimeout(performSearch,SEARCH_DEBOUNCE_MS);
+  showNotice("");
+  setConnection("sync","Buscando");
+  searchTimer=setTimeout(()=>{
+    performSearch().catch(error=>{
+      console.error("Fallo inesperado al buscar",error);
+      searchBusy=false;
+      setConnection("offline","Sin conexión");
+      showNotice(`No se pudo completar la búsqueda: ${friendlyError(error)}`,"error");
+    });
+  },SEARCH_DEBOUNCE_MS);
 });
 els.clearSearchBtn.onclick=()=>{
   els.searchInput.value="";

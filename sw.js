@@ -1,5 +1,5 @@
-// NUBE VOLADORA PCJS V4.5 - CACHE BUSQUEDA GLOBAL NORMALIZADA
-const CACHE = "siit-pcjs-google-v4-5-busqueda-global";
+// NUBE VOLADORA PCJS V4.6 - CACHE BUSQUEDA GLOBAL ESTABLE
+const CACHE = "siit-pcjs-google-v4-6-busqueda-estable";
 const ASSETS = ["./","./index.html","./styles.css","./app.js","./site-config.js","./manifest.webmanifest","./icons/icon-192.png","./icons/icon-512.png"];
 
 self.addEventListener("install", event =>
