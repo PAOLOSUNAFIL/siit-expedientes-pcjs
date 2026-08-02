@@ -1,4 +1,4 @@
-// NUBE VOLADORA PCJS V4.4 - BUSQUEDA RAPIDA Y ESTABLE - 02/08/2026
+// NUBE VOLADORA PCJS V4.5 - BUSQUEDA GLOBAL NORMALIZADA - 02/08/2026
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3";
 const GOOGLE_SCOPE = "openid email profile https://www.googleapis.com/auth/drive";
@@ -8,6 +8,8 @@ const CACHE_KEY = "siit_pcjs_google_cache_v2";
 const FAV_KEY = "siit_pcjs_google_favorites_v2";
 const AUTO_REFRESH_MS = 30000;
 const FOLDER_INDEX_TTL_MS = 10 * 60 * 1000;
+const SEARCH_INDEX_TTL_MS = 5 * 60 * 1000;
+const SEARCH_INDEX_MAX_ITEMS = 50000;
 const SEARCH_RESULT_LIMIT = 1000;
 const SEARCH_MIN_CHARS = 2;
 const SEARCH_DEBOUNCE_MS = 220;
@@ -45,6 +47,10 @@ let folderIndex = new Map();
 let folderIndexPromise = null;
 let folderIndexUpdatedAt = 0;
 let folderIndexGeneration = 0;
+let globalSearchIndex = [];
+let globalSearchIndexPromise = null;
+let globalSearchIndexUpdatedAt = 0;
+let globalSearchIndexGeneration = 0;
 let searchRunId = 0;
 let searchBusy = false;
 
@@ -287,6 +293,9 @@ function invalidateSearchCaches() {
   folderIndex = new Map();
   folderIndexUpdatedAt = 0;
   folderIndexGeneration++;
+  globalSearchIndex = [];
+  globalSearchIndexUpdatedAt = 0;
+  globalSearchIndexGeneration++;
 }
 function isFolderIndexFresh() {
   return folderIndex.size > 0 && Date.now() - folderIndexUpdatedAt < FOLDER_INDEX_TTL_MS;
@@ -312,8 +321,41 @@ async function getFolderIndex({force=false}={}) {
     .finally(()=>{folderIndexPromise=null;});
   return folderIndexPromise;
 }
-function warmFolderIndex() {
-  setTimeout(()=>getFolderIndex().catch(error=>console.warn("No se pudo preparar el índice de carpetas",error)),600);
+function isGlobalSearchIndexFresh() {
+  return globalSearchIndex.length > 0 && Date.now() - globalSearchIndexUpdatedAt < SEARCH_INDEX_TTL_MS;
+}
+async function buildGlobalSearchIndex() {
+  const [folders, allItems] = await Promise.all([
+    getFolderIndex(),
+    driveList(`trashed = false`, {orderBy:"folder,name", maxPages:50, maxItems:SEARCH_INDEX_MAX_ITEMS})
+  ]);
+  const seen = new Set();
+  return allItems
+    .map(item=>annotateItemInsideRoot(item,folders))
+    .filter(Boolean)
+    .filter(item=>{
+      if(seen.has(item.id))return false;
+      seen.add(item.id);
+      return true;
+    });
+}
+async function getGlobalSearchIndex({force=false}={}) {
+  if(!force&&isGlobalSearchIndexFresh())return globalSearchIndex;
+  if(globalSearchIndexPromise)return globalSearchIndexPromise;
+  const generation=globalSearchIndexGeneration;
+  globalSearchIndexPromise=buildGlobalSearchIndex()
+    .then(items=>{
+      if(generation===globalSearchIndexGeneration){
+        globalSearchIndex=items;
+        globalSearchIndexUpdatedAt=Date.now();
+      }
+      return items;
+    })
+    .finally(()=>{globalSearchIndexPromise=null;});
+  return globalSearchIndexPromise;
+}
+function warmSearchIndex() {
+  setTimeout(()=>getGlobalSearchIndex().catch(error=>console.warn("No se pudo preparar el índice global de búsqueda",error)),400);
 }
 function cancelSearchInteraction() {
   clearTimeout(searchTimer);
@@ -363,51 +405,13 @@ function getDirectSearchScore(item,normalizedQuery,tokens) {
   if(containsMatch&&item.folder)return 4;
   return 5;
 }
-function buildDriveNameQuery(query,tokens) {
-  const rawTokens=String(query).trim().split(/[\s_\-./\\]+/).filter(Boolean);
-  const seeds=[rawTokens[0]||"",tokens[0]||""]
-    .map(value=>value.trim())
-    .filter(value=>value.length>=SEARCH_MIN_CHARS);
-  const unique=[...new Set(seeds.map(value=>value.toLocaleLowerCase("es")))];
-  if(!unique.length)return "";
-  const clauses=unique.map(seed=>`name contains '${escapeQuery(seed)}'`);
-  return `(${clauses.join(" or ")}) and trashed = false`;
-}
-async function findDriveCandidates(query,tokens) {
-  const q=buildDriveNameQuery(query,tokens);
-  if(!q)return [];
-  const [folders,candidates]=await Promise.all([
-    getFolderIndex(),
-    driveList(q,{orderBy:"folder,name",maxPages:12,maxItems:10000})
-  ]);
-  return candidates
-    .map(item=>annotateItemInsideRoot(item,folders))
-    .filter(Boolean);
-}
-function quickRootMatches(query) {
-  const normalized=normalizeSearchText(query);
-  const tokens=normalized.split(" ").filter(Boolean);
-  if(!tokens.length)return [];
-  return rootFolders
-    .map(item=>({
-      ...item,
-      searchPath:item.name,
-      searchLocation:"Repositorio central",
-      normalizedName:normalizeSearchText(item.name),
-      nameWords:normalizeSearchText(item.name).split(" ").filter(Boolean)
-    }))
-    .map(item=>({item,score:getDirectSearchScore(item,normalized,tokens)}))
-    .filter(result=>result.score!==null)
-    .sort((a,b)=>a.score-b.score||a.item.name.localeCompare(b.item.name,"es",{numeric:true,sensitivity:"base"}))
-    .map(result=>result.item);
-}
 async function scopedSearch(query) {
   const normalized=normalizeSearchText(query);
   const tokens=normalized.split(" ").filter(Boolean);
   if(!tokens.length||normalized.replace(/\s+/g,"").length<SEARCH_MIN_CHARS)return [];
-  const candidates=await findDriveCandidates(query,tokens);
+  const index=await getGlobalSearchIndex();
   const seen=new Set();
-  return candidates
+  return index
     .map(item=>({item,score:getDirectSearchScore(item,normalized,tokens)}))
     .filter(result=>result.score!==null)
     .filter(result=>{
@@ -427,7 +431,7 @@ async function enterApp() {
   hideLogin(); setConnection("sync","Conectando");
   const initial=(account?.name||account?.email||"P").trim().charAt(0).toUpperCase();
   els.accountBtn.textContent=initial||"P";
-  try { await ensureRootFolder(); await loadDashboard(); setConnection("online","Sincronizado"); startAutoRefresh(); warmFolderIndex(); }
+  try { await ensureRootFolder(); await loadDashboard(); setConnection("online","Sincronizado"); startAutoRefresh(); warmSearchIndex(); }
   catch(error) { console.error(error); setConnection("offline","Sin conexión"); showNotice(friendlyError(error),"error"); renderCacheFallback(); }
 }
 async function loadDashboard(silent=false) {
@@ -492,7 +496,7 @@ async function performSearch() {
   currentItems=quick;
   renderItems(quick,true);
   updateStats(rootFolders,quick.filter(item=>!item.folder).length);
-  showNotice(`Buscando “${query}” en carpetas y documentos…`);
+  showNotice(globalSearchIndex.length ? `Buscando “${query}” en todo el repositorio…` : `Preparando la búsqueda completa y buscando “${query}”…`);
 
   try {
     let matches=await scopedSearch(query);
